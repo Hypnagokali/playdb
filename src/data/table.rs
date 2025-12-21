@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 
 use thiserror::Error;
 
-use crate::{data::page::Page, schema::{ColumnType, TableSchema}};
+use crate::{data::page::Page, schema::{self, ColumnType, TableSchema}};
 
 #[derive(Debug)]
 pub enum Cell {
@@ -38,6 +38,21 @@ impl Row {
             bytes.extend(cell.serialize());
         }
         bytes
+    }
+
+    // ToDo: return Result<Row, RowDeserializationError> instead of using unwrap
+    fn deserialize(row_data: &[u8], schema: &TableSchema) -> Self {
+        let mut next = row_data;
+        let mut cells = Vec::new();
+        for col in schema.columns.iter() {
+            let (cell, next_bytes) = Cell::deserialize(next, &col).unwrap();
+            next = next_bytes;
+            cells.push(cell);
+        }
+
+        Row {
+            cells,
+        }
     }
 
     pub fn validate(&self, schema: &TableSchema) -> Result<(), RowValidationError> {
@@ -128,6 +143,13 @@ impl Table {
 
 }
 
+
+#[derive(Debug, Error)]
+pub enum CellDeserializationError {
+    #[error("Cell deserialization error")]
+    InvalidData,
+}
+
 impl Cell {
     pub fn serialize(&self) -> Vec<u8> {
         match self {
@@ -138,6 +160,42 @@ impl Cell {
                 bytes.extend_from_slice(s.as_bytes());
                 bytes
             },
+        }
+    }
+
+    pub fn deserialize<'a>(row_data: &'a [u8], column: &schema::Column) -> Result<(Self, &'a [u8]), CellDeserializationError> {
+        match &column.col_type {
+            ColumnType::Int => {
+                if row_data.len() < 4 {
+                    return Err(CellDeserializationError::InvalidData);
+                }
+                let int_bytes = &row_data[0..4];
+                let int_value = i32::from_be_bytes(
+                    int_bytes.try_into()
+                        .map_err(|_| CellDeserializationError::InvalidData)?
+                );
+                Ok((Cell::Int(int_value), &row_data[4..]))
+            }
+            ColumnType::Varchar(_) => {
+                if row_data.len() < 2 {
+                    // needs at least 2 bytes for length
+                    return Err(CellDeserializationError::InvalidData);
+                }
+                let len_bytes = &row_data[0..2];
+                let str_len = u16::from_be_bytes(
+                    len_bytes.try_into()
+                        .map_err(|_| CellDeserializationError::InvalidData)?
+                ) as usize;
+                if row_data.len() < (2 + str_len) {
+                    return Err(CellDeserializationError::InvalidData);
+                }
+
+                let str_bytes = &row_data[2..2 + str_len];
+                let str_value = String::from_utf8(str_bytes.to_vec())
+                    .map_err(|_| CellDeserializationError::InvalidData)?;
+
+                Ok((Cell::Varchar(str_value), &row_data[2 + str_len..]))
+            }
         }
     }
 }
