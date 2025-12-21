@@ -163,6 +163,7 @@ impl Cell {
         }
     }
 
+    // ToDo: better error handling
     pub fn deserialize<'a>(row_data: &'a [u8], column: &schema::Column) -> Result<(Self, &'a [u8]), CellDeserializationError> {
         match &column.col_type {
             ColumnType::Int => {
@@ -176,7 +177,7 @@ impl Cell {
                 );
                 Ok((Cell::Int(int_value), &row_data[4..]))
             }
-            ColumnType::Varchar(_) => {
+            ColumnType::Varchar(len) => {
                 if row_data.len() < 2 {
                     // needs at least 2 bytes for length
                     return Err(CellDeserializationError::InvalidData);
@@ -187,6 +188,10 @@ impl Cell {
                         .map_err(|_| CellDeserializationError::InvalidData)?
                 ) as usize;
                 if row_data.len() < (2 + str_len) {
+                    return Err(CellDeserializationError::InvalidData);
+                }
+
+                if str_len > *len as usize {
                     return Err(CellDeserializationError::InvalidData);
                 }
 
@@ -204,6 +209,35 @@ impl Cell {
 mod tests {
     use crate::data::table::{Cell, Row, RowValidationError, Table};
     use crate::schema::{Column, ColumnType, TableSchema};
+
+    #[test]
+    fn should_serialize_deserialize_row() {
+        let columns = vec![
+            Column::new("id", ColumnType::Int),
+            Column::new("name", ColumnType::Varchar(25)),
+        ];
+        let schema = TableSchema::new("TestTable", columns);
+
+        let row = Row {
+            cells: vec![
+                Cell::Int(42),
+                Cell::Varchar("TestName".to_string()),
+            ],
+        };
+
+        let serialized = row.serialize();
+        let deserialized = Row::deserialize(&serialized, &schema);
+
+        match (&row.cells[0], &deserialized.cells[0]) {
+            (Cell::Int(a), Cell::Int(b)) => assert_eq!(a, b),
+            _ => panic!("Mismatched cell types for first cell"),
+        }
+
+        match (&row.cells[1], &deserialized.cells[1]) {
+            (Cell::Varchar(a), Cell::Varchar(b)) => assert_eq!(a, b),
+            _ => panic!("Mismatched cell types for second cell"),
+        }
+    }
 
     #[test]
     fn should_insert_table() {
