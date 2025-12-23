@@ -41,18 +41,16 @@ impl Row {
     }
 
     // ToDo: return Result<Row, RowDeserializationError> instead of using unwrap
-    fn deserialize(row_data: &[u8], schema: &TableSchema) -> Self {
-        let mut next = row_data;
+    pub fn deserialize(row_data: &[u8], schema: &TableSchema) -> (Self, usize) {
         let mut cells = Vec::new();
+        let mut offset = 0;
         for col in schema.columns.iter() {
-            let (cell, next_bytes) = Cell::deserialize(next, &col).unwrap();
-            next = next_bytes;
+            let (cell, bytes_read) = Cell::deserialize(&row_data[offset..], &col).unwrap();
+            offset += bytes_read;
             cells.push(cell);
         }
 
-        Row {
-            cells,
-        }
+        (Row {  cells }, offset)
     }
 
     pub fn validate(&self, schema: &TableSchema) -> Result<(), RowValidationError> {
@@ -83,6 +81,29 @@ impl Row {
 impl Table {
     pub fn drop(&self) {
         std::fs::remove_file(&self.file_path).expect("Failed to delete table file");
+    }
+
+    pub fn load_all(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&self.file_path)
+            .expect("Failed to open table file");
+
+        let total_pages = Page::pages(&file);
+
+        // PageIterator would be better
+        for page_number in 0..total_pages {
+            let page = Page::from_file(&mut file, page_number)
+                .expect("Failed to read page from file");
+
+            for row in page.rows(&self.schema) {
+                rows.push(row);
+            }
+        }
+
+        rows
     }
 
     pub fn insert(&self, row: &Row) {
@@ -164,7 +185,8 @@ impl Cell {
     }
 
     // ToDo: better error handling
-    pub fn deserialize<'a>(row_data: &'a [u8], column: &schema::Column) -> Result<(Self, &'a [u8]), CellDeserializationError> {
+    // Returns: (Cell, number of bytes read)
+    pub fn deserialize<'a>(row_data: &'a [u8], column: &schema::Column) -> Result<(Self, usize), CellDeserializationError> {
         match &column.col_type {
             ColumnType::Int => {
                 if row_data.len() < 4 {
@@ -175,7 +197,7 @@ impl Cell {
                     int_bytes.try_into()
                         .map_err(|_| CellDeserializationError::InvalidData)?
                 );
-                Ok((Cell::Int(int_value), &row_data[4..]))
+                Ok((Cell::Int(int_value), 4))
             }
             ColumnType::Varchar(len) => {
                 if row_data.len() < 2 {
@@ -199,7 +221,7 @@ impl Cell {
                 let str_value = String::from_utf8(str_bytes.to_vec())
                     .map_err(|_| CellDeserializationError::InvalidData)?;
 
-                Ok((Cell::Varchar(str_value), &row_data[2 + str_len..]))
+                Ok((Cell::Varchar(str_value), 2 + str_len))
             }
         }
     }
@@ -226,7 +248,7 @@ mod tests {
         };
 
         let serialized = row.serialize();
-        let deserialized = Row::deserialize(&serialized, &schema);
+        let (deserialized, _) = Row::deserialize(&serialized, &schema);
 
         match (&row.cells[0], &deserialized.cells[0]) {
             (Cell::Int(a), Cell::Int(b)) => assert_eq!(a, b),
@@ -268,6 +290,9 @@ mod tests {
         table.insert(&row);
         let file = std::fs::metadata("test_table.dat").unwrap();
         assert!(file.len() == 4096);
+
+        let rows = table.load_all();
+        assert_eq!(rows.len(), 2);
 
         // Clean up
         table.drop();

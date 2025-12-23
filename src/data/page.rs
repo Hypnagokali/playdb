@@ -1,6 +1,8 @@
 use std::{fs::File, io::{Read, Seek, SeekFrom}};
 use thiserror::Error;
 
+use crate::{data::table::Row, schema::TableSchema};
+
 const PAGE_SIZE: usize = 4096;
 
 // Todo: should not be a constant
@@ -11,6 +13,39 @@ pub struct Page {
     offset: usize,
     page_number: u32,
     num_rows: u16,
+}
+
+pub struct PageRowIterator<'a> {
+    data: &'a [u8],
+    offset: usize,
+    end: usize,
+    schema: &'a TableSchema,
+}
+
+impl<'a> PageRowIterator<'a> {
+    pub fn new(page: &'a Page, schema: &'a TableSchema) -> Self {
+        Self { 
+            data: &page.data,
+            offset: 0,
+            end: page.offset,
+            schema 
+        }
+    }
+}
+
+impl Iterator for PageRowIterator<'_> {
+    type Item = Row;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.end {
+            return None;
+        }
+
+        let (next_row, byte_offset) = Row::deserialize(&self.data[self.offset..self.end], self.schema);
+
+        self.offset += byte_offset;
+        Some(next_row)
+    }
 }
 
 #[derive(Error, Debug)]
@@ -30,6 +65,10 @@ impl Page {
             num_rows: 0,
             page_number: 0,
         }
+    }
+
+    pub fn row_data(&self) -> &[u8] {
+        &self.data
     }
 
     pub fn create_next(&self) -> Self {
@@ -75,6 +114,11 @@ impl Page {
 
     pub fn number(&self) -> u32 {
         self.page_number
+    }
+
+    // What about moving self here?
+    pub fn rows<'a>(&'a self, schema: &'a TableSchema) -> PageRowIterator<'a> {
+        PageRowIterator::new(self, schema)
     }
 
     pub fn insert_row(&mut self, row_bytes: &[u8], file: &mut File) -> Result<(), PageError> {
