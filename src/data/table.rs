@@ -91,7 +91,7 @@ impl Table {
             .open(&self.file_path)
             .expect("Failed to open table file");
 
-        let total_pages = Page::pages(&file);
+        let total_pages = Page::count_pages(&file);
 
         // PageIterator would be better
         for page_number in 0..total_pages {
@@ -120,21 +120,20 @@ impl Table {
             .expect("Failed to open table file");
 
         // Iterate over pages and find place to insert (just for simplicity)
-        let pages = Page::pages(&file);
         let row_bytes = row.serialize();
         let mut row_written = false;
 
-        for page_counter in 0..pages {
-            println!("Is there space in page {}?", page_counter);
-            let mut page = Page::from_file(&mut file, page_counter)
-                    .expect("Failed to read page from file");
+
+        // ToDo: don't clone file handle: Page should  
+        for mut page in Page::page_iter(file.try_clone().expect("Failed to clone file handle")) {
+            println!("Is there space in page {}?", page.number());
 
             let space = page.space_remaining();
 
             println!("Space left in page: {}", space);
 
             if space >= row_bytes.len() {
-                println!("There is enough space in page. Write row to page {}", page_counter);
+                println!("There is enough space in page. Write row to page {}", page.number());
 
                 match page.insert_row(&row_bytes, &mut file) {
                     Ok(_) => {

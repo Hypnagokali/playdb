@@ -15,6 +15,37 @@ pub struct Page {
     num_rows: u16,
 }
 
+pub struct PageIterator {
+    file: File,
+    current_page: usize,
+    total_pages: usize,
+}
+
+impl PageIterator {
+    pub fn new(file: File) -> Self {
+        let total_pages = Page::count_pages(&file);
+        Self {
+            file,
+            current_page: 0,
+            total_pages,
+        }
+    }
+}
+
+impl Iterator for PageIterator {
+    type Item = Page;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_page >= self.total_pages {
+            return None;
+        }
+
+        let page = Page::from_file(&mut self.file, self.current_page).ok()?;
+        self.current_page += 1;
+        Some(page)
+    }
+}
+
 pub struct PageRowIterator<'a> {
     data: &'a [u8],
     offset: usize,
@@ -77,7 +108,7 @@ impl Page {
         new
     }
 
-    pub fn pages(file: &File) -> usize {
+    pub fn count_pages(file: &File) -> usize {
         let metadata = file.metadata().unwrap();
         (metadata.len() / PAGE_SIZE as u64) as usize
     }
@@ -114,6 +145,10 @@ impl Page {
 
     pub fn number(&self) -> u32 {
         self.page_number
+    }
+
+    pub fn page_iter(file: File) -> PageIterator {
+        PageIterator::new(file)
     }
 
     // What about moving self here?
