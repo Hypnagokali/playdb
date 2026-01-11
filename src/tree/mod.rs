@@ -1,8 +1,8 @@
 // Copied from from my algos_test repo
 use std::u32;
 
-mod store;
-pub mod node;
+pub mod store;
+mod node;
 
 pub fn read_u32_with_null(raw_value: u32) -> Option<u32> {
     if raw_value == u32::MAX {

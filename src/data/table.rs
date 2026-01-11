@@ -284,10 +284,12 @@ mod tests {
                 Column {
                     name: "id".to_string(),
                     col_type: ColumnType::Int,
+                    index_file: None,
                 },
                 Column {
                     name: "name".to_string(),
                     col_type: ColumnType::Varchar(10),
+                    index_file: None,
                 },
             ],
         };
