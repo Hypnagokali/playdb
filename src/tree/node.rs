@@ -1,0 +1,466 @@
+use std::{cell::RefCell, mem, u32};
+
+use derive_getters::Getters;
+
+use crate::tree::store::NodePager;
+
+enum FindKeyResponse {
+    GreaterThanTheLast(usize),
+    Equal(usize),
+    LessThan(usize)
+}
+
+#[derive(Debug, Getters)]
+pub struct NodePage {
+    id: u32, // u32::MAX is a new page
+    deleted: bool,
+    next_deleted_page: Option<u32>,
+    keys: Vec<u32>,
+    children: Vec<u32>, // stores page number (page_id)
+    values: Vec<u32>, // each item points to a page of rows
+    max_degree: usize,
+    changed: RefCell<bool>, // flag is not stored, indicates, if the node has been changed
+    // next_leaf: Option<u32> TODO: linked list between leaves
+}
+
+impl NodePage {
+    pub fn keys_mut(&mut self) -> &mut Vec<u32> {
+        *self.changed.borrow_mut() = true;
+        &mut self.keys
+    }
+
+    pub fn children_mut(&mut self) -> &mut Vec<u32> {
+        *self.changed.borrow_mut() = true;
+        &mut self.children
+    }
+
+    pub fn values_mut(&mut self) -> &mut Vec<u32> {
+        *self.changed.borrow_mut() = true;
+        &mut self.values
+    }
+
+    pub fn delete_page(&mut self, next_deleted: Option<u32>) {
+        self.deleted = true;
+        *self.changed.borrow_mut() = true;
+        self.keys = Vec::new();
+        self.children = Vec::new();
+        self.values = Vec::new();
+        self.next_deleted_page = next_deleted;
+    }
+
+    pub fn reallocate(&mut self) {
+        self.deleted = false;
+        *self.changed.borrow_mut() = true;
+        self.keys = Vec::new();
+        self.children = Vec::new();
+        self.values = Vec::new();
+        self.next_deleted_page = None;
+    }
+    pub fn new(max_degree: usize, id: u32) -> Self {
+        if id == u32::MAX {
+            panic!("Cannot write page with id 0xFFFFFFFF");
+        }
+        Self {
+            id,
+            deleted: false,
+            next_deleted_page: None,
+            values: Vec::new(),
+            keys: Vec::new(),
+            children: Vec::new(),
+            max_degree,
+            changed: RefCell::new(true),
+        }
+    }
+
+    pub fn new_from_store(
+        id: u32,
+        deleted: bool,
+        next_deleted_page: Option<u32>,
+        keys: Vec<u32>,
+        children: Vec<u32>,
+        values: Vec<u32>,
+        max_degree: usize
+    ) -> Self {
+        Self {
+            id,
+            deleted,
+            next_deleted_page,
+            keys,
+            children,
+            values,
+            max_degree,
+            changed: RefCell::new(false),
+        }
+
+    }
+}
+
+impl NodePage {
+    // pub fn depth(&self, level: u16) -> u16 {
+    //     let first = self.children.first();
+
+    //     if let Some(first) = first {
+    //         first.depth(level + 1)
+    //     } else {
+    //         level + 1
+    //     }
+    // }
+
+    pub fn min_keys(&self) -> usize {
+        (self.max_keys() as f32 / 2.0).ceil() as usize
+    }
+
+    pub fn max_keys(&self) -> usize {
+        self.max_degree - 1
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+    }
+
+    // #[cfg(test)]
+    // fn validate(&self, min_key: Option<u32>, max_key: Option<u32>) {
+    //     self.check_node_invariants();
+    //     if let Some(min_key) = min_key {
+    //         assert!(self.keys.iter().all(|k| *k >= min_key), "All Keys must be greater or equal than min_key. min_key: {}, keys:{:?}", min_key, self.keys);
+    //     }
+
+    //     if let Some(max_key) = max_key {
+    //         assert!(self.keys.iter().all(|k| *k < max_key), "All Keys must be less than max_key. max_key: {}, keys:{:?}", max_key, self.keys);
+    //     }
+
+    //     for i in 0..self.children.len() {
+    //         let child_min = match i {
+    //             0 => min_key,
+    //             _ => Some(self.keys[i - 1]),
+    //         };
+
+    //         let child_max = match i {
+    //             i if i < self.keys.len() => Some(self.keys[i]),
+    //             _ => max_key,
+    //         };
+
+    //         self.children[i].validate(child_min, child_max);
+    //     }
+    // }
+
+    #[cfg(test)]
+    fn check_node_invariants(&self) {
+        assert!(!self.keys.is_empty(), "Keys must never be empty: {:?}", self);
+        if self.is_leaf() {
+            assert_eq!(self.children.len(), 0, "Children in leaf must be always empty");
+            assert_eq!(self.values.len(), self.keys.len(), "Every key must have a value in a leaf");
+        } else {
+            assert_eq!(
+                self.children.len(),
+                self.keys.len() + 1, 
+                "Internal node must have one more children than keys. keys: {:?}, children: {:?}", self.keys, self.children);
+            assert_eq!(self.values.len(), 0, "Internal node must not have values");
+            assert!(!self.children.is_empty(), "Children must not be empty if not leaf: {:?}", self);
+        }
+
+        assert!(self.max_degree > self.keys.len(), "Max degree must be greater than key len. Keys: {:?}", self.keys);
+
+        assert!(self.keys.windows(2).all(|pair| pair[0] < pair[1]), "Keys must be sorted. Keys in this node: {:?}", self.keys);
+    }
+
+    // returns new left node, new right node and the key (K) for the parent
+    pub fn split(&mut self, pager: &NodePager) -> (NodePage, NodePage, u32) {
+        // check invariants before split
+        let middle_value_index = self.keys.len() / 2;
+
+        let mut right_keys = self.keys.split_off(middle_value_index);
+        let mut right_children = Vec::new();
+        let mut right_values = Vec::new();
+
+        let left_keys;
+        let mut left_children = Vec::new();
+        let mut left_values = Vec::new();
+
+        let promoted_key;
+        
+        if !self.is_leaf() {
+            right_children = self.children.split_off(middle_value_index + 1);
+            left_children = mem::take(&mut self.children);
+
+            promoted_key = right_keys.remove(0); // Key promotes and gets removed
+        } else {
+            right_values = self.values.split_off(middle_value_index);
+            left_values = mem::take(&mut self.values);
+
+            promoted_key = right_keys[0]; // Key stays in right node and promotes
+        }
+        left_keys = mem::take(&mut self.keys);
+
+        let mut left_node = pager.allocate_new_page().unwrap();
+        left_node.values = left_values;
+        left_node.keys = left_keys;
+        left_node.children = left_children;
+        left_node.max_degree = *self.max_degree();
+        
+        pager.write_page(&left_node).unwrap();
+
+        let mut right_node = pager.allocate_new_page().unwrap();
+        right_node.values = right_values;
+        right_node.keys = right_keys;
+        right_node.children = right_children;
+        right_node.max_degree = *self.max_degree();
+
+        pager.write_page(&right_node).unwrap();
+
+        *self.changed.borrow_mut() = true;
+        (left_node, right_node, promoted_key)
+    }
+
+    fn find_key_index(&self, key: u32) -> FindKeyResponse {
+        for (i, &k) in self.keys.iter().enumerate() {
+            if key < k {
+                return FindKeyResponse::LessThan(i);
+            } else if key == k {
+                return FindKeyResponse::Equal(i);
+            }
+        }
+        
+        FindKeyResponse::GreaterThanTheLast(self.keys.len().saturating_sub(1))
+    }
+
+    fn insert_key_value(&mut self, key: u32, value: u32) {
+        match self.find_key_index(key) {
+            FindKeyResponse::LessThan(i) => {
+                self.keys.insert(i, key);
+                self.values.insert(i, value);
+                *self.changed.borrow_mut() = true;
+            },
+            FindKeyResponse::GreaterThanTheLast(_) => {
+                self.keys.push(key);
+                self.values.push(value);
+                *self.changed.borrow_mut() = true;
+            },
+            FindKeyResponse::Equal(_) => {},
+        }      
+ 
+        #[cfg(test)]
+        self.check_node_invariants();
+    }
+    
+    pub fn insert(&mut self, pager: &NodePager, key: u32, value: u32) {
+        // if is leaf, then insert key and value
+        if self.is_leaf() {
+            self.insert_key_value(key, value); 
+        } else {
+            // if not leaf:
+
+            // 1. find correct Node
+            let mut node_index= self.keys.iter().enumerate()
+                .find(|(_, k)| key < **k)
+                .map(|(i, _)| i)
+                .unwrap_or(self.children.len() - 1);
+
+            // 2. if Node is full, split
+            let mut child = pager.read_page(self.children[node_index]).unwrap();
+            let mut split = false;
+            if child.is_full() {
+                    split = true;
+                    let (lnode, rnode, new_key) = child.split(pager);
+                    if self.keys.len() == node_index {
+                        // append at the end
+                        self.keys.push(new_key);
+                        self.children[node_index] = *lnode.id();
+                        self.children.push(*rnode.id());
+
+                        if key > new_key {
+                            node_index += 1;
+                        }
+                    } else {
+                        self.keys.insert(node_index, new_key);
+                        self.children.insert(node_index, *rnode.id());
+                        self.children.insert(node_index, *lnode.id());
+                        if key < new_key {
+                            node_index -= 1;
+                        }
+                    }
+                    *self.changed.borrow_mut() = true;
+            }
+        
+            // 3. insert into next node
+            if split {
+                // node_index has changed, that's why the child is loaded again
+                child = pager.read_page(self.children[node_index]).unwrap();
+            }
+
+            child.insert(pager, key, value);
+            pager.write_page(&child).unwrap();
+        }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.keys.len() >= self.max_keys()
+    }
+
+    pub fn can_lend_keys(&self) -> bool {
+        self.keys.len() > self.min_keys()
+    }
+
+    pub fn is_less_than_minimal(&self) -> bool {
+        self.keys.len() < self.min_keys()
+    }
+
+    pub fn find(&self, pager: &NodePager, key: u32) -> Option<u32> {
+        match self.find_key_index(key) {
+            // is leaf
+            FindKeyResponse::GreaterThanTheLast(_) if self.is_leaf() => None,
+            FindKeyResponse::LessThan(_) if self.is_leaf() => None,
+            FindKeyResponse::Equal(i) if self.is_leaf() => Some(self.values[i]),
+            // internal node
+            FindKeyResponse::GreaterThanTheLast(i) 
+                | FindKeyResponse::Equal(i) => {
+                    let child = pager.read_page(self.children[i + 1]).unwrap();
+                    child.find(pager, key)
+            },
+            FindKeyResponse::LessThan(i) => {
+                let child = pager.read_page(self.children[i]).unwrap();
+                child.find(pager, key)
+            }
+        }
+    }
+
+    // Delete a key from this subtree. Returns the removed value if present.
+    pub fn delete(&mut self, pager: &NodePager, key: u32) -> Option<u32> {
+        if self.is_leaf() {
+            // TODO: use binary search
+            if let Some(pos) = self.keys.iter().position(|k| *k == key) {
+                self.keys.remove(pos);
+                let v = self.values.remove(pos);
+                *self.changed.borrow_mut() = true;
+                return Some(v);
+            }
+            return None;
+        }
+
+        let node_index = self.keys.iter().enumerate()
+            .find(|(_, k)| key < **k)
+            .map(|(i, _)| i)
+            .unwrap_or(self.children.len() - 1);
+
+        let mut target_node = pager.read_page(self.children[node_index]).unwrap();
+        // Refactoring: MERGE
+        // self.merge(node_index)
+        if target_node.is_less_than_minimal() {
+            
+            let left_neighbor_can_lend = if node_index > 0  {
+                let left = pager.read_page(self.children[node_index - 1]).unwrap();
+                let can_lend = left.can_lend_keys();
+                Some((left, can_lend))
+            } else {
+                None
+            };
+
+            let right_neighbor_can_lend = if node_index + 1 < self.children.len() {
+                let right = pager.read_page(self.children[node_index + 1]).unwrap();
+                let can_lend = right.can_lend_keys();
+                Some((right, can_lend))
+            } else {
+                None
+            };
+
+            if let Some((mut left_node, true)) = left_neighbor_can_lend {
+                // There is a left_node and the left node can lend
+                if target_node.is_leaf() {
+                    let k = left_node.keys.pop().unwrap();
+                    let v = left_node.values.pop().unwrap();
+                    target_node.keys.insert(0, k);
+                    target_node.values.insert(0, v);
+                    self.keys[node_index - 1] = target_node.keys[0];
+                } else {
+                    let left_key = left_node.keys.pop().unwrap();
+                    let left_child = left_node.children.pop().unwrap();
+                    let parent_key = self.keys[node_index - 1];
+                    target_node.keys.insert(0, parent_key);
+                    target_node.children.insert(0, left_child);
+                    self.keys[node_index - 1] = left_key;
+                }
+                *target_node.changed.borrow_mut() = true;
+                *left_node.changed.borrow_mut() = true;
+                *self.changed.borrow_mut() = true;
+
+                pager.write_page(&target_node).unwrap();
+                pager.write_page(&left_node).unwrap();
+            } else if let Some((mut right_node, true)) = right_neighbor_can_lend {
+                // There is a right_node and the right node can lend
+                if target_node.is_leaf() {
+                    let k = right_node.keys.remove(0);
+                    let v = right_node.values.remove(0);
+                    target_node.keys.push(k);
+                    target_node.values.push(v);
+                    self.keys[node_index] = right_node.keys[0];
+                } else {
+                    let right_key = right_node.keys.remove(0);
+                    let right_child = right_node.children.remove(0);
+                    let parent_key = self.keys[node_index];
+                    target_node.keys.push(parent_key);
+                    target_node.children.push(right_child);
+                    self.keys[node_index] = right_key;
+                }
+
+                *target_node.changed.borrow_mut() = true;
+                *right_node.changed.borrow_mut() = true;
+                *self.changed.borrow_mut() = true;
+
+                pager.write_page(&target_node).unwrap();
+                pager.write_page(&right_node).unwrap();
+            } else {
+                // must merge with a sibling:
+                if let Some((mut left_node, _)) = left_neighbor_can_lend {
+                    // Target node will be deleted and all keys, children, values will be moved to the left node
+                    // the left node will then be the new target node
+                    let left_index = node_index - 1;
+                    // Remove reference to the target node
+                    self.children.remove(node_index);
+
+                    // remove left key from parent
+                    let separator = self.keys.remove(left_index);
+                    if left_node.is_leaf() {
+                        left_node.keys.extend(std::mem::take(&mut target_node.keys).into_iter());
+                        left_node.values.extend(std::mem::take(&mut target_node.values).into_iter());
+                    } else {
+                        left_node.keys.push(separator);
+                        left_node.keys.extend(std::mem::take(&mut target_node.keys).into_iter());
+                        left_node.children.extend(std::mem::take(&mut target_node.children).into_iter());
+                    }
+                    *left_node.changed.borrow_mut() = true;
+                    *self.changed.borrow_mut() = true;
+                    pager.write_page(&left_node).unwrap();
+                    pager.delete_page(*target_node.id()).unwrap();
+
+                    // delete must be executed in the left node
+                    target_node = left_node;
+                } else if let Some((mut right_node, _)) = right_neighbor_can_lend {
+                    // merge target node with the right node and delete the right node completely
+                    self.children.remove(node_index + 1);
+
+                    let separator = self.keys.remove(node_index);
+                    if target_node.is_leaf() {
+                        target_node.keys.extend(std::mem::take(&mut right_node.keys).into_iter());
+                        target_node.values.extend(std::mem::take(&mut right_node.values).into_iter());
+                    } else {
+                        // set parents separator in target_node to match the references to the children
+                        target_node.keys.push(separator);
+                        target_node.keys.extend(std::mem::take(&mut right_node.keys).into_iter());
+                        target_node.children.extend(std::mem::take(&mut right_node.children).into_iter());
+                    }
+
+                    *target_node.changed.borrow_mut() = true;
+                    *self.changed.borrow_mut() = true;
+                    pager.write_page(&target_node).unwrap();
+                    pager.delete_page(*right_node.id()).unwrap();
+                }
+                // No need for else-statement, because there should never be another state. Either left or right node must exist.
+            }
+        }
+
+        let res = target_node.delete(pager, key);
+        pager.write_page(&target_node).unwrap();
+
+        res
+    }
+}
