@@ -1,50 +1,107 @@
-use std::{fs::File, io::{Read, Seek, SeekFrom}};
 use thiserror::Error;
 
-use crate::{data::table::Row, schema::TableSchema};
+use crate::{table::table::Row, table::TableSchema};
 
-const PAGE_SIZE: usize = 4096;
-
-// Todo: should not be a constant
-const DATA_SIZE: usize = 4086;
-
-pub struct Page {
-    data: Vec<u8>,
-    offset: usize,
-    page_number: u32,
-    num_rows: u16,
+pub struct PageDataLayout {
+    page_size: usize,
 }
 
-pub struct PageIterator {
-    file: File,
-    current_page: usize,
-    total_pages: usize,
+impl PageDataLayout {
+    const INDEX_NUMBER_ROWS: usize = 0;
+    const INDEX_OFFSET: usize = 2;
+    const INDEX_PAGE_ID: usize = 6;
+    const INDEX_FREE_SLOTS_OFFSET: usize = 10;
+
+    pub const META_DATA_SIZE: usize = 8;    // 4 bytes next_id, 4 bytes number_of_pages
+
+    // 2 bytes num_rows, 4 bytes offset, 4 bytes page_id
+    const PAGE_HEADER_SIZE: usize = 10;
+    const FREE_DATA_TUPLE_SIZE: usize = 6; // 4 bytes offset, 2 bytes length
+    const MAX_ROW_LENGTH: u16 = u16::MAX;
+
+    pub fn new(page_size: usize) -> Self {
+        Self { page_size }
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    pub fn max_data_size(&self) -> usize {
+        self.page_size - Self::PAGE_HEADER_SIZE
+    }
+
+    pub fn metadata_size(&self) -> usize {
+        Self::META_DATA_SIZE
+    }
+
 }
 
-impl PageIterator {
-    pub fn new(file: File) -> Self {
-        let total_pages = Page::count_pages(&file);
+pub struct PageFileMetadata {
+    next_id: i32, // There is currently just a signed int for ids
+    number_of_pages: i32, // because of next_id being i32
+}
+
+impl PageFileMetadata {
+    pub fn new() -> Self {
         Self {
-            file,
-            current_page: 0,
-            total_pages,
+            next_id: 1,
+            number_of_pages: 0,
         }
+    }
+    pub fn deserialize(buf: &[u8]) -> Self {
+        let next_id = i32::from_be_bytes(buf[0..4].try_into().unwrap());
+        let number_of_pages = i32::from_be_bytes(buf[4..8].try_into().unwrap());
+        Self {
+            next_id,
+            number_of_pages,
+        }
+    }
+    pub fn serialize(&self, layout: &PageDataLayout) -> Vec<u8> {
+        let mut buf = vec![0u8; layout.metadata_size()];
+        buf[0..4].copy_from_slice(&self.next_id.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.number_of_pages.to_be_bytes());
+        buf
+    }
+    pub fn next_id(&self) -> i32 {
+        self.next_id
+    }
+
+    pub fn number_of_pages(&self) -> i32 {
+        self.number_of_pages
+    }
+
+    pub fn allocate_next_page_id(&mut self) -> i32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.number_of_pages += 1;
+        id
     }
 }
 
-impl Iterator for PageIterator {
-    type Item = Page;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_page >= self.total_pages {
-            return None;
-        }
-
-        let page = Page::from_file(&mut self.file, self.current_page).ok()?;
-        self.current_page += 1;
-        Some(page)
-    }
+// Page Layout
+// ------------
+// Header
+// ------------
+// free_slots (go downwards)
+// slot1
+// slot2
+// ...
+// ...
+// row2
+// row1
+// rows (go upwards)
+pub struct Page<'database> {
+    data: Vec<u8>,
+    free_slots: Vec<(usize, u16)>,  // redundant (stored in data) (pointer to free space (on disk as i32), free bytes)
+    layout: &'database PageDataLayout,
+    // header
+    num_rows: u16,
+    data_offset: usize, // usize used internally for easier handling (but it's actually an i32) goes from page_size to 0
+    free_slots_offset: usize, // stored as i32 (goes from 0 to page_size)
+    page_id: i32, // it's because of id being a i32
 }
+
 
 pub struct PageRowIterator<'a> {
     data: &'a [u8],
@@ -58,7 +115,7 @@ impl<'a> PageRowIterator<'a> {
         Self { 
             data: &page.data,
             offset: 0,
-            end: page.offset,
+            end: page.data_offset,
             schema 
         }
     }
@@ -87,68 +144,52 @@ pub enum PageError {
     ReadPageError,
 }
 
-#[cfg(target_pointer_width = "64")]
-impl Page {
-    pub fn new() -> Self {
+#[cfg(target_pointer_width = "64")] // so that I can use always 8 bytes for usize
+impl<'database> Page<'database> {
+    pub fn new(layout: &'database PageDataLayout) -> Self {
         Self {
-            data: vec![0; DATA_SIZE],
-            offset: 0,
+            layout,
+            data: vec![0; layout.max_data_size()],
+            data_offset: layout.page_size(),
             num_rows: 0,
-            page_number: 0,
+            page_id: 0,
+            free_slots: Vec::new(),
+            free_slots_offset: 0,
         }
     }
 
     pub fn row_data(&self) -> &[u8] {
         &self.data
     }
+    pub fn offset(&self) -> usize {
+        self.data_offset
+    }
 
+    pub fn page_number(&self) -> i32 {
+        self.page_id
+    }
+
+    pub fn num_rows(&self) -> u16 {
+        self.num_rows
+    }
+
+    pub fn page_id(&self) -> i32 {
+        self.page_id
+    }
+
+    pub fn set_page_id(&mut self, page_id: i32) {
+        self.page_id = page_id;
+    }
+
+    // There should be somewhere an allocation method for a new page
     pub fn create_next(&self) -> Self {
-        let mut new = Self::new();
-        new.page_number = self.page_number + 1;
+        let mut new = Self::new(self.layout);
+        new.page_id = self.page_id + 1;
         new
     }
 
-    pub fn count_pages(file: &File) -> usize {
-        let metadata = file.metadata().unwrap();
-        (metadata.len() / PAGE_SIZE as u64) as usize
-    }
-
-    pub fn last_page(file: &mut File) -> Option<Self> {
-        let metadata = file.metadata().unwrap();
-        if metadata.len() == 0 {
-            None
-        } else {
-            let last_page_number = (metadata.len() / PAGE_SIZE as u64 - 1);
-            Self::from_file(file, last_page_number as usize).ok()
-        }
-    }
-
-    pub fn from_file(file: &mut File, page_counter: usize) -> Result<Page, PageError> {
-        let mut data = vec![0; PAGE_SIZE];
-        file.seek(SeekFrom::Start((page_counter * PAGE_SIZE) as u64))
-            .map_err(|_| PageError::ReadPageError)?;
-    
-        file.read_exact(&mut data)
-            .map_err(|e| {
-                println!("Error reading page: {}", e);
-                PageError::ReadPageError
-            })?;
-
-        let p = Page::deserialize(&data);
-        println!("Page loaded: number {}, rows {}, offset {}", p.page_number, p.num_rows, p.offset);
-        Ok(p)
-    }
-
     pub fn space_remaining(&self) -> usize {
-        PAGE_SIZE - self.offset
-    }
-
-    pub fn number(&self) -> u32 {
-        self.page_number
-    }
-
-    pub fn page_iter(file: File) -> PageIterator {
-        PageIterator::new(file)
+        self.layout.page_size - (self.layout.page_size() - self.data_offset) - PageDataLayout::FREE_DATA_TUPLE_SIZE * self.free_slots.len()
     }
 
     // What about moving self here?
@@ -156,52 +197,72 @@ impl Page {
         PageRowIterator::new(self, schema)
     }
 
-    pub fn insert_row(&mut self, row_bytes: &[u8], file: &mut File) -> Result<(), PageError> {
-        use std::io::Write;
-
-        if self.offset + row_bytes.len() > DATA_SIZE {
+    pub fn insert_row(&mut self, row_bytes: Vec<u8>) -> Result<(), PageError> {
+        if self.data_offset + row_bytes.len() > self.layout.max_data_size() {
             return Err(PageError::InsertRowError);
         }
 
-        let end = self.offset + row_bytes.len();
-        self.data[self.offset..end].copy_from_slice(row_bytes);
-        self.offset += row_bytes.len();
+        let end = self.data_offset + row_bytes.len();
+        self.data[self.data_offset..end].copy_from_slice(&row_bytes);
+        self.data_offset += row_bytes.len();
         self.num_rows += 1;
-
-        file.seek(SeekFrom::Start((self.page_number as usize * PAGE_SIZE) as u64))
-            .map_err(|_| PageError::InsertRowError)?;
-
-        file.write_all(&self.serialize())
-            .map_err(|_| PageError::InsertRowError)?;
         
         Ok(())
     }
 
-    fn serialize(&self) -> [u8; PAGE_SIZE] {
-        let mut buf = [0u8; PAGE_SIZE];
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; self.layout.page_size()];
         // Number of rows 2 Bytes
-        buf[0..2].copy_from_slice(&self.num_rows.to_be_bytes());
+        buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_OFFSET].copy_from_slice(&self.num_rows.to_be_bytes());
         // Offset 4 Bytes
-        let offset_bytes = (self.offset as u32).to_be_bytes();
-        buf[2..6].copy_from_slice(&offset_bytes);
-        // Page number 4 Bytes
-        let page_number_bytes = self.page_number.to_be_bytes();
-        buf[6..10].copy_from_slice(&page_number_bytes);
-
-        buf[10..PAGE_SIZE].copy_from_slice(&self.data);
+        let offset_bytes = (self.data_offset as u32).to_be_bytes();
+        buf[PageDataLayout::INDEX_OFFSET..PageDataLayout::INDEX_PAGE_ID].copy_from_slice(&offset_bytes);
+        // PageId 4 Bytes
+        let page_id_bytes = self.page_id.to_be_bytes();
+        buf[PageDataLayout::INDEX_PAGE_ID..PageDataLayout::INDEX_FREE_SLOTS_OFFSET].copy_from_slice(&page_id_bytes);
+        let free_slots_offset_bytes = (self.free_slots_offset as i32).to_be_bytes();
+        buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET..PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4].copy_from_slice(&free_slots_offset_bytes);
+        
+        // Free slots are only deserialized and are directly inserted into the data array when a row is deleted
+        // or removed /updated if a new row is inserted at that position
+        buf[10..self.layout.page_size()].copy_from_slice(&self.data);
         buf
     }
 
-    fn deserialize(buf: &[u8]) -> Self {
-        let num_rows = u16::from_be_bytes([buf[0], buf[1]]);
-        let offset = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
-        let page_number = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
-        let data = buf[10..PAGE_SIZE].to_vec();
+    pub fn deserialize(buf: &[u8], layout: &'database PageDataLayout) -> Self {
+        let num_rows = u16::from_be_bytes(
+            buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_OFFSET].try_into().unwrap()
+        );
+
+        let offset = i32::from_be_bytes(
+            buf[PageDataLayout::INDEX_OFFSET..PageDataLayout::INDEX_PAGE_ID].try_into().unwrap()
+        
+        );
+        let page_id = i32::from_be_bytes(
+            buf[PageDataLayout::INDEX_PAGE_ID..PageDataLayout::INDEX_FREE_SLOTS_OFFSET].try_into().unwrap()
+        );
+
+        let free_slots_offset = i32::from_be_bytes(
+            buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET..PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4].try_into().unwrap()
+        ) as usize;
+
+        let data = buf[PageDataLayout::INDEX_PAGE_ID + 4..layout.page_size()].to_vec();
+        let free_slots: Vec<(usize, u16)> = data[0..free_slots_offset].to_vec()
+            .windows(6)
+            .map(|window| {
+                let offset = i32::from_be_bytes(window[0..4].try_into().unwrap()) as usize;
+                let length = u16::from_be_bytes(window[4..6].try_into().unwrap());
+                (offset, length)
+            }).collect();
+
         Self {
+            layout,
             num_rows,
-            offset: offset as usize,
-            page_number,
+            data_offset: offset as usize,
+            page_id,
             data,
+            free_slots,
+            free_slots_offset,
         }
     }
 }
