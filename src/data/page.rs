@@ -17,6 +17,8 @@ impl PageDataLayout {
     // 2 bytes num_rows, 4 bytes offset, 4 bytes page_id
     const PAGE_HEADER_SIZE: usize = 10;
     const FREE_DATA_TUPLE_SIZE: usize = 6; // 4 bytes offset, 2 bytes length
+    const FREE_DATA_TUPLE_OFFSET_INDEX: usize = 0;
+    const FREE_DATA_TUPLE_LENGTH_INDEX: usize = 4;
     const MAX_ROW_LENGTH: u16 = u16::MAX;
 
     pub fn new(page_size: usize) -> Self {
@@ -189,7 +191,8 @@ impl<'database> Page<'database> {
     }
 
     pub fn space_remaining(&self) -> usize {
-        self.layout.page_size - (self.layout.page_size() - self.data_offset) - PageDataLayout::FREE_DATA_TUPLE_SIZE * self.free_slots.len()
+        // page_size - row_data - (free_slots + size of next free_slot entry)
+        self.layout.page_size - (self.layout.page_size() - self.data_offset) - PageDataLayout::FREE_DATA_TUPLE_SIZE * (self.free_slots.len() + 1)
     }
 
     // What about moving self here?
@@ -202,12 +205,31 @@ impl<'database> Page<'database> {
             return Err(PageError::InsertRowError);
         }
 
-        let end = self.data_offset + row_bytes.len();
-        self.data[self.data_offset..end].copy_from_slice(&row_bytes);
-        self.data_offset += row_bytes.len();
+        
+        let start_of_data = self.data_offset - row_bytes.len();
+        self.data[start_of_data..self.data_offset].copy_from_slice(&row_bytes);
+        self.data_offset -= row_bytes.len();
         self.num_rows += 1;
+
+        // reserve free slot for this row
+        self.allocate_free_slot(start_of_data);
         
         Ok(())
+    }
+
+    fn allocate_free_slot(&mut self, offset: usize) {
+        self.free_slots.push((offset, 0));
+
+        let offset_index = self.free_slots_offset + PageDataLayout::FREE_DATA_TUPLE_OFFSET_INDEX;
+        let length_index = offset_index + PageDataLayout::FREE_DATA_TUPLE_LENGTH_INDEX;
+
+        self.data[self.free_slots_offset..offset_index]
+            .copy_from_slice(&(offset as i32).to_be_bytes());
+
+        self.data[offset_index..length_index]
+            .copy_from_slice(&(0u16).to_be_bytes());
+
+        self.free_slots_offset += PageDataLayout::FREE_DATA_TUPLE_SIZE;
     }
 
     pub fn serialize(&self) -> Vec<u8> {
