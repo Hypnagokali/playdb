@@ -205,7 +205,6 @@ impl<'database> Page<'database> {
             return Err(PageError::InsertRowError);
         }
 
-        
         let start_of_data = self.data_offset - row_bytes.len();
         self.data[start_of_data..self.data_offset].copy_from_slice(&row_bytes);
         self.data_offset -= row_bytes.len();

@@ -11,7 +11,9 @@ pub enum Cell {
 
 #[derive(Debug)]
 pub struct Row {
+    // move deleted and index later into something like PageRow?
     deleted: bool,
+    index: i32,
     cells: Vec<Cell>,
 }
 
@@ -35,7 +37,9 @@ pub enum RowValidationError {
 impl Row {
     pub fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        // First byte: deleted flag
+        // First 4 bytes: index
+        bytes.extend(self.index.to_be_bytes());
+        // 5th byte: deleted flag
         bytes.push(if self.deleted { 1 } else { 0 });
         // Remaining bytes: cells
         for cell in &self.cells {
@@ -48,8 +52,9 @@ impl Row {
     pub fn deserialize(row_data: &[u8], schema: &TableSchema) -> (Self, usize) {
         let mut cells = Vec::new();
         let mut offset = 0;
-        // First byte: deleted flag
-        let deleted = if row_data.len() > 0 && row_data[0] != 0 { true } else { false };
+        let index = i32::from_be_bytes(row_data[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let deleted = if row_data.len() > 0 && row_data[4] != 0 { true } else { false };
         offset += 1;
         for col in schema.columns.iter() {
             let (cell, bytes_read) = Cell::deserialize(&row_data[offset..], &col).unwrap();
@@ -57,7 +62,7 @@ impl Row {
             cells.push(cell);
         }
 
-        (Row { deleted, cells }, offset)
+        (Row { deleted, index, cells }, offset)
     }
 
     pub fn validate(&self, schema: &TableSchema) -> Result<(), RowValidationError> {
