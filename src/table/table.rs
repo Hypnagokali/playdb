@@ -173,3 +173,131 @@ impl Cell {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::table::Column;
+
+    #[test]
+    fn test_row_serialize_basic() {
+        let cells = vec![
+            Cell::Int(42),
+            Cell::Varchar("hello".to_string()),
+            Cell::Byte(1),
+        ];
+
+        let row = Row {
+            deleted: false,
+            index: 100,
+            cells,
+        };
+
+        let serialized = row.serialize();
+
+        // Index
+        assert_eq!(&serialized[0..4], &100i32.to_be_bytes());
+        // Deleted flag
+        assert_eq!(serialized[4], 0);
+        // Cell 1: Int
+        assert_eq!(&serialized[5..9], &42i32.to_be_bytes());
+        // Varchar("hello"): 2 bytes length + 5 bytes data
+        assert_eq!(&serialized[9..11], &5u16.to_be_bytes());
+        assert_eq!(&serialized[11..16], b"hello");
+        // Byte(1): 1 byte
+        assert_eq!(serialized[16], 1);
+    }
+
+    #[test]
+    fn test_row_serialize_deleted_flag() {
+        let cells = vec![Cell::Int(99)];
+
+        let row = Row {
+            deleted: true,
+            index: 50,
+            cells,
+        };
+
+        let serialized = row.serialize();
+
+        // Index: 50
+        assert_eq!(&serialized[0..4], &50i32.to_be_bytes());
+        // Deleted: true
+        assert_eq!(serialized[4], 1);
+    }
+
+    #[test]
+    fn test_row_serialize_empty_varchar() {
+        let cells = vec![Cell::Varchar(String::new())];
+
+        let row = Row {
+            deleted: false,
+            index: 0,
+            cells,
+        };
+
+        let serialized = row.serialize();
+        
+        // Index: 0
+        assert_eq!(&serialized[0..4], &0i32.to_be_bytes());
+        // Deleted: false
+        assert_eq!(serialized[4], 0);
+        // Varchar length: 0
+        assert_eq!(&serialized[5..7], &0u16.to_be_bytes());
+        assert_eq!(serialized.len(), 7);
+    }
+
+    #[test]
+    fn test_row_deserialize_basic() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int),
+            Column::new(2, "name", ColumnType::Varchar(50)),
+            Column::new(3, "flag", ColumnType::Byte),
+        ]);
+
+        let mut data = Vec::new();
+        // Index: 100
+        data.extend(100i32.to_be_bytes());
+        // Deleted: false
+        data.push(0);
+        // Int(42)
+        data.extend(42i32.to_be_bytes());
+        // Varchar("hello")
+        data.extend(5u16.to_be_bytes());
+        data.extend_from_slice(b"hello");
+        // Byte(1)
+        data.push(1);
+
+        let (row, bytes_read) = Row::deserialize(&data, &schema);
+
+        assert_eq!(row.index, 100);
+        assert_eq!(row.deleted, false);
+        assert_eq!(bytes_read, data.len());
+
+        let cells = row.cells;
+
+        assert!(matches!(&cells[0], Cell::Int(42)));
+        assert!(matches!(&cells[1], Cell::Varchar(s) if s == "hello"));
+        assert!(matches!(&cells[2], Cell::Byte(1)));
+    }
+
+    #[test]
+    fn test_row_deserialize_deleted_flag() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int),
+        ]);
+
+        let mut data = Vec::new();
+        // Index: 50
+        data.extend(50i32.to_be_bytes());
+        // Deleted: true
+        data.push(1);
+        // Int(99)
+        data.extend(99i32.to_be_bytes());
+
+        let (row, _) = Row::deserialize(&data, &schema);
+
+        assert_eq!(row.index, 50);
+        assert_eq!(row.deleted, true);
+    }
+}
