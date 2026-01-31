@@ -1,14 +1,12 @@
 use thiserror::Error;
 
-use crate::{table::table::Row, table::TableSchema};
-
 pub struct PageDataLayout {
     page_size: usize,
 }
 
 impl PageDataLayout {
     const INDEX_NUMBER_ROWS: usize = 0;
-    const INDEX_OFFSET: usize = 2;
+    const INDEX_ROW_OFFSET: usize = 2;
     const INDEX_PAGE_ID: usize = 6;
     const INDEX_FREE_SLOTS_OFFSET: usize = 10;
 
@@ -104,40 +102,6 @@ pub struct Page<'database> {
     page_id: i32, // it's because of id being a i32
 }
 
-
-pub struct PageRowIterator<'a> {
-    data: &'a [u8],
-    offset: usize,
-    end: usize,
-    schema: &'a TableSchema,
-}
-
-impl<'a> PageRowIterator<'a> {
-    pub fn new(page: &'a Page, schema: &'a TableSchema) -> Self {
-        Self { 
-            data: &page.data,
-            offset: 0,
-            end: page.data_offset,
-            schema 
-        }
-    }
-}
-
-impl Iterator for PageRowIterator<'_> {
-    type Item = Row;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.end {
-            return None;
-        }
-
-        let (next_row, byte_offset) = Row::deserialize(&self.data[self.offset..self.end], self.schema);
-
-        self.offset += byte_offset;
-        Some(next_row)
-    }
-}
-
 #[derive(Error, Debug)]
 pub enum PageError {
     #[error("Failed to insert row into page. Page is full.")]
@@ -152,7 +116,7 @@ impl<'database> Page<'database> {
         Self {
             layout,
             data: vec![0; layout.max_data_size()],
-            data_offset: layout.page_size(),
+            data_offset: layout.page_size() - 1,
             num_rows: 0,
             page_id: 0,
             free_slots: Vec::new(),
@@ -161,7 +125,7 @@ impl<'database> Page<'database> {
     }
 
     pub fn row_data(&self) -> &[u8] {
-        &self.data
+        &self.data[self.data_offset..self.layout.page_size()]
     }
     pub fn offset(&self) -> usize {
         self.data_offset
@@ -169,6 +133,10 @@ impl<'database> Page<'database> {
 
     pub fn page_number(&self) -> i32 {
         self.page_id
+    }
+
+    pub fn row_data_length(&self) -> usize {
+        self.layout.page_size() - self.data_offset
     }
 
     pub fn num_rows(&self) -> u16 {
@@ -193,11 +161,6 @@ impl<'database> Page<'database> {
     pub fn space_remaining(&self) -> usize {
         // page_size - row_data - (free_slots + size of next free_slot entry)
         self.layout.page_size - (self.layout.page_size() - self.data_offset) - PageDataLayout::FREE_DATA_TUPLE_SIZE * (self.free_slots.len() + 1)
-    }
-
-    // What about moving self here?
-    pub fn rows<'a>(&'a self, schema: &'a TableSchema) -> PageRowIterator<'a> {
-        PageRowIterator::new(self, schema)
     }
 
     pub fn insert_row(&mut self, row_bytes: Vec<u8>) -> Result<(), PageError> {
@@ -234,10 +197,10 @@ impl<'database> Page<'database> {
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = vec![0u8; self.layout.page_size()];
         // Number of rows 2 Bytes
-        buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_OFFSET].copy_from_slice(&self.num_rows.to_be_bytes());
+        buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_ROW_OFFSET].copy_from_slice(&self.num_rows.to_be_bytes());
         // Offset 4 Bytes
         let offset_bytes = (self.data_offset as u32).to_be_bytes();
-        buf[PageDataLayout::INDEX_OFFSET..PageDataLayout::INDEX_PAGE_ID].copy_from_slice(&offset_bytes);
+        buf[PageDataLayout::INDEX_ROW_OFFSET..PageDataLayout::INDEX_PAGE_ID].copy_from_slice(&offset_bytes);
         // PageId 4 Bytes
         let page_id_bytes = self.page_id.to_be_bytes();
         buf[PageDataLayout::INDEX_PAGE_ID..PageDataLayout::INDEX_FREE_SLOTS_OFFSET].copy_from_slice(&page_id_bytes);
@@ -252,11 +215,11 @@ impl<'database> Page<'database> {
 
     pub fn deserialize(buf: &[u8], layout: &'database PageDataLayout) -> Self {
         let num_rows = u16::from_be_bytes(
-            buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_OFFSET].try_into().unwrap()
+            buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_ROW_OFFSET].try_into().unwrap()
         );
 
         let offset = i32::from_be_bytes(
-            buf[PageDataLayout::INDEX_OFFSET..PageDataLayout::INDEX_PAGE_ID].try_into().unwrap()
+            buf[PageDataLayout::INDEX_ROW_OFFSET..PageDataLayout::INDEX_PAGE_ID].try_into().unwrap()
         
         );
         let page_id = i32::from_be_bytes(

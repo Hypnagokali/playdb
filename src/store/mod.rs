@@ -2,7 +2,7 @@ pub mod file_store;
 
 use thiserror::Error;
 
-use crate::{data::page::{Page, PageDataLayout, PageFileMetadata}, table::table::Table};
+use crate::{data::page::{Page, PageDataLayout, PageFileMetadata}, table::{TableSchema, table::{Row, Table}}};
 
 // Store is always owned by a Database instance
 pub trait Store {
@@ -50,6 +50,39 @@ impl<'db, S: Store> Iterator for PageIterator<'db, S> {
 
         self.current_page += 1;
         Some(page)
+    }
+}
+
+pub struct PageRowIterator<'a> {
+    data: &'a [u8],
+    offset: usize,
+    end: usize,
+    schema: &'a TableSchema,
+}
+
+impl<'a> PageRowIterator<'a> {
+    pub fn new(page: &'a Page, schema: &'a TableSchema) -> Self {
+        Self { 
+            data: page.row_data(),
+            offset: 0,
+            end: page.row_data_length(),
+            schema 
+        }
+    }
+}
+
+impl Iterator for PageRowIterator<'_> {
+    type Item = Row;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.end {
+            return None;
+        }
+
+        let (next_row, byte_offset) = Row::deserialize(&self.data[self.offset..self.end], self.schema);
+
+        self.offset += byte_offset;
+        Some(next_row)
     }
 }
 

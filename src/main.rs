@@ -1,11 +1,11 @@
-// ignore unused while developing
-#[allow(unused)]
+// ignore dead_code while developing
+#[allow(dead_code)]
 mod table;
-#[allow(unused)]
+#[allow(dead_code)]
 mod data;
-#[allow(unused)]
+#[allow(dead_code)]
 mod store;
-#[allow(unused)]
+#[allow(dead_code)]
 mod database;
 
 fn main() {

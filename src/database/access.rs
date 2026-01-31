@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{data::page::{PageDataLayout, PageError}, store::Store, table::table::{Row, RowValidationError, Table}};
+use crate::{data::page::{PageDataLayout, PageError}, store::{PageRowIterator, Store}, table::table::{Row, RowValidationError, Table}};
 
 pub struct TableAccess<'db, S: ?Sized> {
     table: &'db Table,
@@ -53,7 +53,9 @@ impl<'db, S: Store> TableAccess<'db, S> {
         // Iterate over all pages and collect rows
         for page_id in 0..total_pages {
             let page = self.store.read_page(self.layout, page_id, self.table)?;
-            for row in page.rows(&self.table.schema) {
+            let page_iterator = PageRowIterator::new(&page, &self.table.schema);
+
+            for row in page_iterator {
                 rows.push(row);
             }
         }
