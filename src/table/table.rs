@@ -80,6 +80,9 @@ impl Row {
                         return Err(RowValidationError::VarcharTooLong(*max_len, column.name.clone()));
                     }
                 }
+                (Cell::Byte(_), ColumnType::Byte) => {
+                    // always valid
+                }
                 _ => {
                     return Err(RowValidationError::TypeMismatch(column.name.clone()));
                 }
@@ -237,7 +240,7 @@ mod tests {
         };
 
         let serialized = row.serialize();
-        
+
         // Index: 0
         assert_eq!(&serialized[0..4], &0i32.to_be_bytes());
         // Deleted: false
@@ -299,5 +302,134 @@ mod tests {
 
         assert_eq!(row.index, 50);
         assert_eq!(row.deleted, true);
+    }
+
+    #[test]
+    fn test_table_file_path() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int),
+        ]);
+
+        let table = Table {
+            id: 42,
+            name: "users".to_string(),
+            schema,
+            num_pages: 5,
+        };
+
+        assert_eq!(table.file_path(), "table_42.dat");
+    }
+
+    #[test]
+    fn should_validate_valid_row() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int),
+            Column::new(2, "name", ColumnType::Varchar(50)),
+            Column::new(3, "active", ColumnType::Byte),
+        ]);
+
+        let table = Table {
+            id: 1,
+            name: "users".to_string(),
+            schema,
+            num_pages: 0,
+        };
+
+        let valid_row = Row {
+            deleted: false,
+            index: 1,
+            cells: vec![
+                Cell::Int(100),
+                Cell::Varchar("John Doe".to_string()),
+                Cell::Byte(128),
+            ],
+        };
+
+        assert!(table.validate_row(&valid_row).is_ok());
+    }
+
+    #[test]
+    fn should_not_validate_row_with_extra_cell() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int),
+            Column::new(2, "name", ColumnType::Varchar(50)),
+        ]);
+
+        let table = Table {
+            id: 1,
+            name: "users".to_string(),
+            schema,
+            num_pages: 0,
+        };
+
+        let invalid_row = Row {
+            deleted: false,
+            index: 1,
+            cells: vec![
+                Cell::Int(100),
+                Cell::Varchar("John Doe".to_string()),
+                Cell::Byte(1), // Extra cell
+            ],
+        };
+
+        let result = table.validate_row(&invalid_row);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), RowValidationError::LengthMismatch));
+    }
+
+    #[test]
+    fn should_not_validate_when_type_mismatch() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int),
+            Column::new(2, "name", ColumnType::Varchar(50)),
+        ]);
+
+        let table = Table {
+            id: 1,
+            name: "users".to_string(),
+            schema,
+            num_pages: 0,
+        };
+
+        let invalid_row = Row {
+            deleted: false,
+            index: 1,
+            cells: vec![
+                Cell::Int(100),
+                Cell::Byte(1),
+            ],
+        };
+
+        let result = table.validate_row(&invalid_row);
+        assert!(result.is_err());
+        
+        matches!(result.unwrap_err(), RowValidationError::TypeMismatch(name) if name == "name");
+    }
+
+    #[test]
+    fn test_table_validate_row_varchar_too_long() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "name", ColumnType::Varchar(10)),
+        ]);
+
+        let table = Table {
+            id: 1,
+            name: "users".to_string(),
+            schema,
+            num_pages: 0,
+        };
+
+        // Row with varchar longer than max length
+        let invalid_row = Row {
+            deleted: false,
+            index: 1,
+            cells: vec![
+                Cell::Varchar("This string is way too long for the column".to_string()),
+            ],
+        };
+
+        let result = table.validate_row(&invalid_row);
+        assert!(result.is_err());
+        matches!(result.unwrap_err(), RowValidationError::VarcharTooLong(10, name) if name == "name");
     }
 }
