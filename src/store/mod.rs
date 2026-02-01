@@ -65,7 +65,7 @@ impl<'a> PageRowIterator<'a> {
         Self { 
             data: page.row_data(),
             offset: 0,
-            end: page.row_data_length(),
+            end: page.row_data_size(),
             schema 
         }
     }

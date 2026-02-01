@@ -40,7 +40,7 @@ impl<'a> Store for FileStore<'a> {
     }
 
     fn read_page<'database>(&self, layout: &'database PageDataLayout, page_id: i32, table: &Table) -> Result<Page<'database>, StoreError> {
-        let mut data = vec![0; layout.max_data_size()];
+        let mut data = vec![0; layout.page_data_size()];
 
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -51,7 +51,7 @@ impl<'a> Store for FileStore<'a> {
         file.read_exact(&mut data)?;
 
         let p = Page::deserialize(&data, layout);
-        println!("Page loaded: number {}, rows {}, offset {}", p.page_id(), p.num_rows(), p.offset());
+        println!("Page loaded: number {}, rows {}, offset {}", p.page_id(), p.num_rows(), p.data_offset());
         Ok(p)
     }
 

@@ -4,30 +4,44 @@ pub struct PageDataLayout {
     page_size: usize,
 }
 
+#[derive(Error, Debug)]
+pub enum PageDataLayoutError {
+    #[error("Invalid page size specified. Page size must be at least 32 bytes.")]
+    InvalidPageSize,
+}
+
 impl PageDataLayout {
     const INDEX_NUMBER_ROWS: usize = 0;
     const INDEX_ROW_OFFSET: usize = 2;
     const INDEX_PAGE_ID: usize = 6;
     const INDEX_FREE_SLOTS_OFFSET: usize = 10;
 
-    pub const META_DATA_SIZE: usize = 8;    // 4 bytes next_id, 4 bytes number_of_pages
+    // table meta data: 4 bytes next_id, 4 bytes number_of_pages
+    pub const META_DATA_SIZE: usize = 8;
+    // page header: 2 bytes num_rows, 4 bytes data_offset, 4 bytes page_id, 4 bytes slots_offset
+    const PAGE_HEADER_SIZE: usize = 14;
+    const MIN_PAGE_SIZE: usize = 32; // just arbitrarily chosen value > 10 and good to test :)
 
-    // 2 bytes num_rows, 4 bytes offset, 4 bytes page_id
-    const PAGE_HEADER_SIZE: usize = 10;
+
+    // free data tuple constants
     const FREE_DATA_TUPLE_SIZE: usize = 6; // 4 bytes offset, 2 bytes length
     const FREE_DATA_TUPLE_OFFSET_INDEX: usize = 0;
     const FREE_DATA_TUPLE_LENGTH_INDEX: usize = 4;
     const MAX_ROW_LENGTH: u16 = u16::MAX;
 
-    pub fn new(page_size: usize) -> Self {
-        Self { page_size }
+    pub fn new(page_size: usize) -> Result<Self, PageDataLayoutError> {
+        if page_size < Self::MIN_PAGE_SIZE {
+            return Err(PageDataLayoutError::InvalidPageSize);
+        }
+
+        Ok(Self { page_size })
     }
 
     pub fn page_size(&self) -> usize {
         self.page_size
     }
 
-    pub fn max_data_size(&self) -> usize {
+    pub fn page_data_size(&self) -> usize {
         self.page_size - Self::PAGE_HEADER_SIZE
     }
 
@@ -97,8 +111,13 @@ pub struct Page<'database> {
     layout: &'database PageDataLayout,
     // header
     num_rows: u16,
-    data_offset: usize, // usize used internally for easier handling (but it's actually an i32) goes from page_size to 0
-    free_slots_offset: usize, // stored as i32 (goes from 0 to page_size)
+    // data_offset is actually the free space pointer
+    // offset uses usize internally for easier handling (but it's actually an i32) 
+    // starts from page_data_size and is heading towards 0
+    data_offset: usize, 
+    // Place where the next free slot can be inserted:
+    // stored as i32 (starts from 0)
+    free_slots_offset: usize,
     page_id: i32, // it's because of id being a i32
 }
 
@@ -115,8 +134,8 @@ impl<'database> Page<'database> {
     pub fn new(layout: &'database PageDataLayout) -> Self {
         Self {
             layout,
-            data: vec![0; layout.max_data_size()],
-            data_offset: layout.page_size() - 1,
+            data: vec![0; layout.page_data_size()],
+            data_offset: layout.page_data_size(),
             num_rows: 0,
             page_id: 0,
             free_slots: Vec::new(),
@@ -125,9 +144,9 @@ impl<'database> Page<'database> {
     }
 
     pub fn row_data(&self) -> &[u8] {
-        &self.data[self.data_offset..self.layout.page_size()]
+        &self.data[self.data_offset..self.layout.page_data_size()]
     }
-    pub fn offset(&self) -> usize {
+    pub fn data_offset(&self) -> usize {
         self.data_offset
     }
 
@@ -135,8 +154,8 @@ impl<'database> Page<'database> {
         self.page_id
     }
 
-    pub fn row_data_length(&self) -> usize {
-        self.layout.page_size() - self.data_offset
+    pub fn row_data_size(&self) -> usize {
+        self.layout.page_data_size() - self.data_offset
     }
 
     pub fn num_rows(&self) -> u16 {
@@ -159,12 +178,12 @@ impl<'database> Page<'database> {
     }
 
     pub fn space_remaining(&self) -> usize {
-        // page_size - row_data - (free_slots + size of next free_slot entry)
-        self.layout.page_size - (self.layout.page_size() - self.data_offset) - PageDataLayout::FREE_DATA_TUPLE_SIZE * (self.free_slots.len() + 1)
+        // page_data_size - row_data_size - (free_slots + size of next free_slot entry)
+        self.layout.page_data_size() - self.row_data_size() - PageDataLayout::FREE_DATA_TUPLE_SIZE * (self.free_slots.len() + 1)
     }
 
     pub fn insert_row(&mut self, row_bytes: Vec<u8>) -> Result<(), PageError> {
-        if self.data_offset + row_bytes.len() > self.layout.max_data_size() {
+        if row_bytes.len() > self.space_remaining() {
             return Err(PageError::InsertRowError);
         }
 
@@ -182,13 +201,14 @@ impl<'database> Page<'database> {
     fn allocate_free_slot(&mut self, offset: usize) {
         self.free_slots.push((offset, 0));
 
-        let offset_index = self.free_slots_offset + PageDataLayout::FREE_DATA_TUPLE_OFFSET_INDEX;
-        let length_index = offset_index + PageDataLayout::FREE_DATA_TUPLE_LENGTH_INDEX;
+        let offset_index_len = self.free_slots_offset + PageDataLayout::FREE_DATA_TUPLE_LENGTH_INDEX;
+        let length_index_len = offset_index_len + 2;
 
-        self.data[self.free_slots_offset..offset_index]
+        println!("offset");
+        self.data[self.free_slots_offset..offset_index_len]
             .copy_from_slice(&(offset as i32).to_be_bytes());
 
-        self.data[offset_index..length_index]
+        self.data[offset_index_len..length_index_len]
             .copy_from_slice(&(0u16).to_be_bytes());
 
         self.free_slots_offset += PageDataLayout::FREE_DATA_TUPLE_SIZE;
@@ -204,11 +224,11 @@ impl<'database> Page<'database> {
         // PageId 4 Bytes
         let page_id_bytes = self.page_id.to_be_bytes();
         buf[PageDataLayout::INDEX_PAGE_ID..PageDataLayout::INDEX_FREE_SLOTS_OFFSET].copy_from_slice(&page_id_bytes);
+        // Free slots offset 4 Bytes
         let free_slots_offset_bytes = (self.free_slots_offset as i32).to_be_bytes();
         buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET..PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4].copy_from_slice(&free_slots_offset_bytes);
         
-        // Free slots are only deserialized and are directly inserted into the data array when a row is deleted
-        // or removed /updated if a new row is inserted at that position
+        // Free slots are redundant and live also in the data array, so it's only needed to serialize the whole data array
         buf[10..self.layout.page_size()].copy_from_slice(&self.data);
         buf
     }
@@ -230,7 +250,7 @@ impl<'database> Page<'database> {
             buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET..PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4].try_into().unwrap()
         ) as usize;
 
-        let data = buf[PageDataLayout::INDEX_PAGE_ID + 4..layout.page_size()].to_vec();
+        let data = buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4..layout.page_size()].to_vec();
         let free_slots: Vec<(usize, u16)> = data[0..free_slots_offset].to_vec()
             .windows(6)
             .map(|window| {
@@ -249,4 +269,42 @@ impl<'database> Page<'database> {
             free_slots_offset,
         }
     }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crate::data::page::{Page, PageDataLayout, PageDataLayoutError};
+
+    #[test]
+    fn should_not_allow_page_layout_size_less_than_32() {
+        let result = PageDataLayout::new(31);
+        assert!(result.is_err());
+        matches!(result.err().unwrap(), PageDataLayoutError::InvalidPageSize);
+    }
+
+    #[test]
+    fn should_allow_page_layout_size_greater_than_31() {
+        let result = PageDataLayout::new(32);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn should_calc_all_values_correctly_when_insert_row() {
+        let layout = PageDataLayout::new(32).unwrap();
+        let mut page = Page::new(&layout);
+
+        // insert 7 bytes
+        let row = vec![1, 2, 3, 4, 5, 6, 7];
+        page.insert_row(row.clone()).unwrap();
+
+        // 32 - 14(header) = 18
+        assert_eq!(page.data.len(), 18);
+        assert_eq!(page.free_slots.len(), 1);
+        assert_eq!(page.free_slots, vec![(11, 0)]);
+        
+        let data = page.row_data();
+        assert_eq!(data, row);
+    }
+
 }
