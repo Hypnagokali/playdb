@@ -150,10 +150,6 @@ impl<'database> Page<'database> {
         self.data_offset
     }
 
-    pub fn page_number(&self) -> i32 {
-        self.page_id
-    }
-
     pub fn row_data_size(&self) -> usize {
         self.layout.page_data_size() - self.data_offset
     }
@@ -229,7 +225,7 @@ impl<'database> Page<'database> {
         buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET..PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4].copy_from_slice(&free_slots_offset_bytes);
         
         // Free slots are redundant and live also in the data array, so it's only needed to serialize the whole data array
-        buf[10..self.layout.page_size()].copy_from_slice(&self.data);
+        buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4..self.layout.page_size()].copy_from_slice(&self.data);
         buf
     }
 
@@ -301,9 +297,33 @@ mod tests {
         // 32 - 14(header) = 18
         assert_eq!(page.data.len(), 18);
         assert_eq!(page.free_slots.len(), 1);
+        //points to offset 11, but no free space
         assert_eq!(page.free_slots, vec![(11, 0)]);
-        
+        assert_eq!(page.row_data_size(), 7);
         let data = page.row_data();
+        assert_eq!(data, row);
+    }
+
+    #[test]
+    fn should_serialize_and_deserialize_correctly() {
+        let layout = PageDataLayout::new(32).unwrap();
+        let mut page = Page::new(&layout);
+
+        // insert 7 bytes
+        let row = vec![1, 2, 3, 4, 5, 6, 7];
+        page.insert_row(row.clone()).unwrap();
+
+        // act: serialize
+        let bytes = page.serialize();
+
+        let deserialized_page = Page::deserialize(&bytes, &layout);
+        // 32 - 14(header) = 18
+        assert_eq!(deserialized_page.data.len(), 18);
+        assert_eq!(deserialized_page.free_slots.len(), 1);
+        //points to offset 11, but no free space
+        assert_eq!(deserialized_page.free_slots, vec![(11, 0)]);
+        assert_eq!(deserialized_page.row_data_size(), 7);
+        let data = deserialized_page.row_data();
         assert_eq!(data, row);
     }
 
