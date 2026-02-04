@@ -24,9 +24,10 @@ impl PageDataLayout {
 
 
     // free data tuple constants
-    const FREE_DATA_TUPLE_SIZE: usize = 6; // 4 bytes offset, 2 bytes length
-    const FREE_DATA_TUPLE_OFFSET_INDEX: usize = 0;
-    const FREE_DATA_TUPLE_LENGTH_INDEX: usize = 4;
+    const SLOT_SIZE: usize = 7; // 4 bytes offset, 2 bytes length
+    const SLOT_DELETED_INDEX: usize = 0;
+    const SLOT_PAGE_OFFSET_INDEX: usize = 1;
+    const SLOT_RECORD_LENGTH_INDEX: usize = 5;
     const MAX_ROW_LENGTH: u16 = u16::MAX;
 
     pub fn new(page_size: usize) -> Result<Self, PageDataLayoutError> {
@@ -93,6 +94,12 @@ impl PageFileMetadata {
     }
 }
 
+struct Slot {
+    record_length: u16,
+    page_offset: usize, // stored as u32
+    deleted: bool,
+}
+
 // Page Layout
 // ------------
 // Header
@@ -107,17 +114,17 @@ impl PageFileMetadata {
 // rows (go upwards)
 pub struct Page<'database> {
     data: Vec<u8>,
-    free_slots: Vec<(usize, u16)>,  // redundant (stored in data) (pointer to free space (on disk as i32), free bytes)
+    slots: Vec<Slot>,
     layout: &'database PageDataLayout,
     // header
     num_rows: u16,
     // data_offset is actually the free space pointer
     // offset uses usize internally for easier handling (but it's actually an i32) 
     // starts from page_data_size and is heading towards 0
-    data_offset: usize, 
+    data_offset: usize,
     // Place where the next free slot can be inserted:
     // stored as i32 (starts from 0)
-    free_slots_offset: usize,
+    slots_offset: usize,
     page_id: i32, // it's because of id being a i32
 }
 
@@ -138,8 +145,8 @@ impl<'database> Page<'database> {
             data_offset: layout.page_data_size(),
             num_rows: 0,
             page_id: 0,
-            free_slots: Vec::new(),
-            free_slots_offset: 0,
+            slots: Vec::new(),
+            slots_offset: 0,
         }
     }
 
@@ -175,11 +182,11 @@ impl<'database> Page<'database> {
 
     pub fn space_remaining(&self) -> usize {
         // page_data_size - row_data_size - (free_slots + size of next free_slot entry)
-        self.layout.page_data_size() - self.row_data_size() - PageDataLayout::FREE_DATA_TUPLE_SIZE * (self.free_slots.len() + 1)
+        self.layout.page_data_size() - self.row_data_size() - PageDataLayout::SLOT_SIZE * (self.slots.len() + 1)
     }
 
     pub fn insert_row(&mut self, row_bytes: Vec<u8>) -> Result<(), PageError> {
-        if row_bytes.len() > self.space_remaining() {
+        if row_bytes.len() > self.space_remaining() || row_bytes.len() > PageDataLayout::MAX_ROW_LENGTH as usize {
             return Err(PageError::InsertRowError);
         }
 
@@ -189,25 +196,29 @@ impl<'database> Page<'database> {
         self.num_rows += 1;
 
         // reserve free slot for this row
-        self.allocate_free_slot(start_of_data);
+        self.allocate_slot(start_of_data, row_bytes.len() as u16);
         
         Ok(())
     }
 
-    fn allocate_free_slot(&mut self, offset: usize) {
-        self.free_slots.push((offset, 0));
+    fn allocate_slot(&mut self, page_offset: usize, record_length: u16) {
+        self.slots.push(Slot { record_length, page_offset, deleted: false });
 
-        let offset_index_len = self.free_slots_offset + PageDataLayout::FREE_DATA_TUPLE_LENGTH_INDEX;
-        let length_index_len = offset_index_len + 2;
+        let offset_index = self.slots_offset + 1; // after delete
+        // TODO: SOMETHING WRONG ()
+        let length_index = self.slots_offset + PageDataLayout::SLOT_RECORD_LENGTH_INDEX;
+        let length_end = length_index + 2;
 
-        println!("offset");
-        self.data[self.free_slots_offset..offset_index_len]
-            .copy_from_slice(&(offset as i32).to_be_bytes());
-
-        self.data[offset_index_len..length_index_len]
+        // deleted flag
+        self.data[self.slots_offset] = 0;
+        // offset
+        self.data[offset_index..length_index]
+            .copy_from_slice(&(page_offset as u32).to_be_bytes());
+        // length
+        self.data[length_index..length_end]
             .copy_from_slice(&(0u16).to_be_bytes());
 
-        self.free_slots_offset += PageDataLayout::FREE_DATA_TUPLE_SIZE;
+        self.slots_offset += PageDataLayout::SLOT_SIZE;
     }
 
     pub fn serialize(&self) -> Vec<u8> {
@@ -221,7 +232,7 @@ impl<'database> Page<'database> {
         let page_id_bytes = self.page_id.to_be_bytes();
         buf[PageDataLayout::INDEX_PAGE_ID..PageDataLayout::INDEX_FREE_SLOTS_OFFSET].copy_from_slice(&page_id_bytes);
         // Free slots offset 4 Bytes
-        let free_slots_offset_bytes = (self.free_slots_offset as i32).to_be_bytes();
+        let free_slots_offset_bytes = (self.slots_offset as i32).to_be_bytes();
         buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET..PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4].copy_from_slice(&free_slots_offset_bytes);
         
         // Free slots are redundant and live also in the data array, so it's only needed to serialize the whole data array
@@ -247,12 +258,17 @@ impl<'database> Page<'database> {
         ) as usize;
 
         let data = buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4..layout.page_size()].to_vec();
-        let free_slots: Vec<(usize, u16)> = data[0..free_slots_offset].to_vec()
-            .windows(6)
+        let free_slots: Vec<Slot> = data[0..free_slots_offset].to_vec()
+            .windows(7)
             .map(|window| {
-                let offset = i32::from_be_bytes(window[0..4].try_into().unwrap()) as usize;
-                let length = u16::from_be_bytes(window[4..6].try_into().unwrap());
-                (offset, length)
+                let deleted = if window[0] == 1 { true } else { false };
+                let offset = u32::from_be_bytes(window[1..5].try_into().unwrap()) as usize;
+                let length = u16::from_be_bytes(window[5..7].try_into().unwrap());
+                Slot {
+                    page_offset: offset,
+                    record_length: length,
+                    deleted,
+                }
             }).collect();
 
         Self {
@@ -261,8 +277,8 @@ impl<'database> Page<'database> {
             data_offset: offset as usize,
             page_id,
             data,
-            free_slots,
-            free_slots_offset,
+            slots: free_slots,
+            slots_offset: free_slots_offset,
         }
     }
 }
@@ -296,9 +312,16 @@ mod tests {
 
         // 32 - 14(header) = 18
         assert_eq!(page.data.len(), 18);
-        assert_eq!(page.free_slots.len(), 1);
+        assert_eq!(page.slots.len(), 1);
         //points to offset 11, but no free space
-        assert_eq!(page.free_slots, vec![(11, 0)]);
+        
+        let slot_option = page.slots.get(0);
+        assert!(slot_option.is_some());
+        let slot = slot_option.unwrap();
+        assert_eq!(slot.deleted, false);
+        assert_eq!(slot.record_length, 7);
+        assert_eq!(slot.page_offset, 11);
+
         assert_eq!(page.row_data_size(), 7);
         let data = page.row_data();
         assert_eq!(data, row);
@@ -319,9 +342,15 @@ mod tests {
         let deserialized_page = Page::deserialize(&bytes, &layout);
         // 32 - 14(header) = 18
         assert_eq!(deserialized_page.data.len(), 18);
-        assert_eq!(deserialized_page.free_slots.len(), 1);
-        //points to offset 11, but no free space
-        assert_eq!(deserialized_page.free_slots, vec![(11, 0)]);
+        assert_eq!(deserialized_page.slots.len(), 1);
+        // Slot points to offset 11, but no isn't deleted
+        let slot_option = page.slots.get(0);
+        assert!(slot_option.is_some());
+        let slot = slot_option.unwrap();
+        assert_eq!(slot.deleted, false);
+        assert_eq!(slot.record_length, 7);
+        assert_eq!(slot.page_offset, 11);
+
         assert_eq!(deserialized_page.row_data_size(), 7);
         let data = deserialized_page.row_data();
         assert_eq!(data, row);
