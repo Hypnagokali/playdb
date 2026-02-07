@@ -11,9 +11,6 @@ pub enum Cell {
 
 #[derive(Debug)]
 pub struct Row {
-    // move deleted and index later into something like PageRow?
-    deleted: bool,
-    index: i32,
     cells: Vec<Cell>,
 }
 
@@ -37,10 +34,6 @@ pub enum RowValidationError {
 impl Row {
     pub fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        // First 4 bytes: index
-        bytes.extend(self.index.to_be_bytes());
-        // 5th byte: deleted flag
-        bytes.push(if self.deleted { 1 } else { 0 });
         // Remaining bytes: cells
         for cell in &self.cells {
             bytes.extend(cell.serialize());
@@ -52,17 +45,14 @@ impl Row {
     pub fn deserialize(row_data: &[u8], schema: &TableSchema) -> (Self, usize) {
         let mut cells = Vec::new();
         let mut offset = 0;
-        let index = i32::from_be_bytes(row_data[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let deleted = if row_data.len() > 0 && row_data[4] != 0 { true } else { false };
-        offset += 1;
         for col in schema.columns.iter() {
             let (cell, bytes_read) = Cell::deserialize(&row_data[offset..], &col).unwrap();
             offset += bytes_read;
             cells.push(cell);
         }
 
-        (Row { deleted, index, cells }, offset)
+        // TODO: offset won't be needed anymore as soon as the RowIterator uses the slots instead of a raw offset
+        (Row { cells }, offset)
     }
 
     pub fn validate(&self, schema: &TableSchema) -> Result<(), RowValidationError> {
@@ -183,129 +173,35 @@ mod tests {
     use crate::table::Column;
 
     #[test]
-    fn test_row_serialize_basic() {
-        let cells = vec![
-            Cell::Int(42),
-            Cell::Varchar("hello".to_string()),
-            Cell::Byte(1),
-        ];
-
-        let row = Row {
-            deleted: false,
-            index: 100,
-            cells,
-        };
-
-        let serialized = row.serialize();
-
-        // Index
-        assert_eq!(&serialized[0..4], &100i32.to_be_bytes());
-        // Deleted flag
-        assert_eq!(serialized[4], 0);
-        // Cell 1: Int
-        assert_eq!(&serialized[5..9], &42i32.to_be_bytes());
-        // Varchar("hello"): 2 bytes length + 5 bytes data
-        assert_eq!(&serialized[9..11], &5u16.to_be_bytes());
-        assert_eq!(&serialized[11..16], b"hello");
-        // Byte(1): 1 byte
-        assert_eq!(serialized[16], 1);
-    }
-
-    #[test]
-    fn test_row_serialize_deleted_flag() {
-        let cells = vec![Cell::Int(99)];
-
-        let row = Row {
-            deleted: true,
-            index: 50,
-            cells,
-        };
-
-        let serialized = row.serialize();
-
-        // Index: 50
-        assert_eq!(&serialized[0..4], &50i32.to_be_bytes());
-        // Deleted: true
-        assert_eq!(serialized[4], 1);
-    }
-
-    #[test]
-    fn test_row_serialize_empty_varchar() {
-        let cells = vec![Cell::Varchar(String::new())];
-
-        let row = Row {
-            deleted: false,
-            index: 0,
-            cells,
-        };
-
-        let serialized = row.serialize();
-
-        // Index: 0
-        assert_eq!(&serialized[0..4], &0i32.to_be_bytes());
-        // Deleted: false
-        assert_eq!(serialized[4], 0);
-        // Varchar length: 0
-        assert_eq!(&serialized[5..7], &0u16.to_be_bytes());
-        assert_eq!(serialized.len(), 7);
-    }
-
-    #[test]
-    fn test_row_deserialize_basic() {
+    fn should_serialize_and_deserialize_correctly() {
         let schema = TableSchema::new(vec![
             Column::new(1, "id", ColumnType::Int),
             Column::new(2, "name", ColumnType::Varchar(50)),
             Column::new(3, "flag", ColumnType::Byte),
         ]);
 
-        let mut data = Vec::new();
-        // Index: 100
-        data.extend(100i32.to_be_bytes());
-        // Deleted: false
-        data.push(0);
-        // Int(42)
-        data.extend(42i32.to_be_bytes());
-        // Varchar("hello")
-        data.extend(5u16.to_be_bytes());
-        data.extend_from_slice(b"hello");
-        // Byte(1)
-        data.push(1);
+        let cells = vec![
+            Cell::Int(42),
+            Cell::Varchar("John".to_string()),
+            Cell::Byte(1),
+        ];
 
-        let (row, bytes_read) = Row::deserialize(&data, &schema);
+        let row = Row {
+            cells,
+        };
 
-        assert_eq!(row.index, 100);
-        assert_eq!(row.deleted, false);
-        assert_eq!(bytes_read, data.len());
+        let serialized = row.serialize();
 
-        let cells = row.cells;
+        let deserialized_row = Row::deserialize(&serialized, &schema).0;
+        let cells = deserialized_row.cells;
 
         assert!(matches!(&cells[0], Cell::Int(42)));
-        assert!(matches!(&cells[1], Cell::Varchar(s) if s == "hello"));
+        assert!(matches!(&cells[1], Cell::Varchar(s) if s == "John"));
         assert!(matches!(&cells[2], Cell::Byte(1)));
     }
 
     #[test]
-    fn test_row_deserialize_deleted_flag() {
-        let schema = TableSchema::new(vec![
-            Column::new(1, "id", ColumnType::Int),
-        ]);
-
-        let mut data = Vec::new();
-        // Index: 50
-        data.extend(50i32.to_be_bytes());
-        // Deleted: true
-        data.push(1);
-        // Int(99)
-        data.extend(99i32.to_be_bytes());
-
-        let (row, _) = Row::deserialize(&data, &schema);
-
-        assert_eq!(row.index, 50);
-        assert_eq!(row.deleted, true);
-    }
-
-    #[test]
-    fn test_table_file_path() {
+    fn table_should_return_table_path_correctly() {
         let schema = TableSchema::new(vec![
             Column::new(1, "id", ColumnType::Int),
         ]);
@@ -336,8 +232,6 @@ mod tests {
         };
 
         let valid_row = Row {
-            deleted: false,
-            index: 1,
             cells: vec![
                 Cell::Int(100),
                 Cell::Varchar("John Doe".to_string()),
@@ -363,8 +257,6 @@ mod tests {
         };
 
         let invalid_row = Row {
-            deleted: false,
-            index: 1,
             cells: vec![
                 Cell::Int(100),
                 Cell::Varchar("John Doe".to_string()),
@@ -392,8 +284,6 @@ mod tests {
         };
 
         let invalid_row = Row {
-            deleted: false,
-            index: 1,
             cells: vec![
                 Cell::Int(100),
                 Cell::Byte(1),
@@ -421,8 +311,6 @@ mod tests {
 
         // Row with varchar longer than max length
         let invalid_row = Row {
-            deleted: false,
-            index: 1,
             cells: vec![
                 Cell::Varchar("This string is way too long for the column".to_string()),
             ],
