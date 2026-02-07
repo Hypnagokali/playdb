@@ -15,9 +15,9 @@ pub struct Row {
 }
 
 pub struct Table {
-    pub id: i32,
-    pub name: String,
-    pub schema: TableSchema,
+    id: i32,
+    name: String,
+    schema: TableSchema,
     num_pages: usize,
 }
 
@@ -32,6 +32,16 @@ pub enum RowValidationError {
 }
 
 impl Row {
+    pub fn new(cells: Vec<Cell>) -> Self {
+        Self {
+            cells,
+        }
+    }
+
+    pub fn cells(&self) -> &Vec<Cell> {
+        &self.cells
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         // Remaining bytes: cells
@@ -84,6 +94,31 @@ impl Row {
 }
 
 impl Table {
+    pub fn new(id: i32, name: String, schema: TableSchema) -> Self {
+        Self {
+            id,
+            name,
+            schema,
+            num_pages: 0,
+        }
+    }
+
+    pub fn id(&self) -> i32 {
+        self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
+
+    pub fn num_pages(&self) -> usize {
+        self.num_pages
+    }
+
     pub fn file_path(&self) -> String {
         format!("table_{}.dat", self.id)
     }

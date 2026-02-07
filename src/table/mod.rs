@@ -22,6 +22,9 @@ pub struct TableSchema {
 
 impl TableSchema {
     pub fn new(columns: Vec<Column>) -> Self {
+        if columns.is_empty() {
+            panic!("Cannot crate empty schema");
+        }
         Self {
             columns,
         }

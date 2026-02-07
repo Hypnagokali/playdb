@@ -1,22 +1,51 @@
-use std::{io::{Read, Seek, SeekFrom, Write}, path::Path};
+use std::{io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
 
-use crate::{data::page::{Page, PageDataLayout, PageFileMetadata}, store::{PageIterator, Store, StoreError}, table::table::Table};
+use crate::{data::page::{Page, PageDataLayout, PageFileMetadata}, store::{Store, StoreError}, table::table::Table};
 
 pub struct FileStore<'a> {
     base_path: &'a Path,
 }
 impl<'a> FileStore<'a> {
     pub fn new(base_path: &'a Path) -> Self {
+        if !base_path.is_dir() {
+            // TODO: Use proper error handling
+            panic!("FileStore needs a directory as a base_path");
+        }
         Self { 
             base_path,
          }
     }
+
+    fn file_path(&self, table: &Table) -> PathBuf {
+        self.base_path.join(table.file_path())
+    }
+
+    fn init(&self, layout: &PageDataLayout, table: &Table) -> Result<(), StoreError> {
+        let metadata = PageFileMetadata::new();
+        self.write_metadata(layout, &metadata, table)
+    }
+
+    fn write_metadata(&self, layout: &PageDataLayout, metadata: &PageFileMetadata, table: &Table) -> Result<(), StoreError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(self.base_path.join(table.file_path()))?;
+
+        file.write_all(&metadata.serialize(layout))?;
+
+        Ok(())
+    }
 }
 impl<'a> Store for FileStore<'a> {
     fn read_metadata(&self, layout: &PageDataLayout, table: &Table) -> Result<PageFileMetadata, StoreError> {
+        let path: PathBuf = self.file_path(table);
+        if !path.exists() {
+            self.init(layout, table)?;
+        }
+
         let mut file = std::fs::OpenOptions::new()
             .read(true)
-            .open(self.base_path.join(table.file_path()))?;
+            .open(path)?;
 
         let fmeta = file.metadata().unwrap();
         if fmeta.len() < layout.metadata_size() as u64 {
@@ -29,18 +58,8 @@ impl<'a> Store for FileStore<'a> {
         Ok(PageFileMetadata::deserialize(&buf))
     }
 
-    fn write_metadata(&self, layout: &PageDataLayout, metadata: &PageFileMetadata, table: &Table) -> Result<(), StoreError> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(self.base_path.join(table.file_path()))?;
-
-        file.write_all(&metadata.serialize(layout))?;
-
-        Ok(())
-    }
-
     fn read_page<'database>(&self, layout: &'database PageDataLayout, page_id: i32, table: &Table) -> Result<Page<'database>, StoreError> {
-        let mut data = vec![0; layout.page_data_size()];
+        let mut page_data = vec![0; layout.page_size()];
 
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -48,9 +67,9 @@ impl<'a> Store for FileStore<'a> {
 
         file.seek(SeekFrom::Start((layout.metadata_size() + page_id as usize * layout.page_size()) as u64))?;
     
-        file.read_exact(&mut data)?;
+        file.read_exact(&mut page_data)?;
 
-        let p = Page::deserialize(&data, layout);
+        let p = Page::deserialize(&page_data, layout);
         println!("Page loaded: number {}, rows {}, offset {}", p.page_id(), p.num_rows(), p.data_offset());
         Ok(p)
     }
@@ -76,8 +95,45 @@ impl<'a> Store for FileStore<'a> {
         self.write_page(layout, &new_page, table)?;
         Ok(new_page)
     }
-    
-    fn page_iterator<'database>(&'database self, layout: &'database PageDataLayout, table: &'database crate::table::table::Table) -> Result<PageIterator<'database, Self>, StoreError> {
-        Ok(PageIterator::new(table, self, layout))
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use crate::{data::page::PageDataLayout, store::{Store, file_store::FileStore}, table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}};
+
+
+    #[test]
+    fn should_allocate_and_write_page() {
+        let dir = tempdir().unwrap();
+        let store = FileStore::new(dir.path());
+
+        let layout = PageDataLayout::new(128).unwrap();
+
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int)
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+
+        let mut new_page = store.allocate_page(&layout, &table).unwrap();
+        assert_eq!(new_page.page_id(), 1);
+
+        let row = Row::new(vec![
+            Cell::Int(42)
+        ]);
+
+        new_page.insert_row(row.serialize()).unwrap();
+
+        store.write_page(&layout, &new_page, &table).unwrap();
+
+        let loaded_page = store.read_page(&layout, 1, &table).unwrap();
+
+        let row = Row::deserialize(loaded_page.row_data(), table.schema()).0;
+
+        assert_eq!(row.cells().len(), 1);
+        matches!(row.cells().get(0).unwrap(), Cell::Int(42));
     }
 }
+

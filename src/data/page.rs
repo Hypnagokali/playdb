@@ -24,7 +24,7 @@ impl PageDataLayout {
 
 
     // free data tuple constants
-    const SLOT_SIZE: usize = 7; // 4 bytes offset, 2 bytes length
+    const SLOT_SIZE: usize = 7; // 4 bytes offset, 2 bytes length, 1 byte deleted flag
     const SLOT_DELETED_INDEX: usize = 0;
     const SLOT_PAGE_OFFSET_INDEX: usize = 1;
     const SLOT_RECORD_LENGTH_INDEX: usize = 5;
@@ -117,7 +117,7 @@ pub struct Page<'database> {
     slots: Vec<Slot>,
     layout: &'database PageDataLayout,
     // header
-    num_rows: u16,
+    number_of_records: u16,
     // data_offset is actually the free space pointer
     // offset uses usize internally for easier handling (but it's actually an i32) 
     // starts from page_data_size and is heading towards 0
@@ -143,7 +143,7 @@ impl<'database> Page<'database> {
             layout,
             data: vec![0; layout.page_data_size()],
             data_offset: layout.page_data_size(),
-            num_rows: 0,
+            number_of_records: 0,
             page_id: 0,
             slots: Vec::new(),
             slots_offset: 0,
@@ -162,7 +162,7 @@ impl<'database> Page<'database> {
     }
 
     pub fn num_rows(&self) -> u16 {
-        self.num_rows
+        self.number_of_records
     }
 
     pub fn page_id(&self) -> i32 {
@@ -193,7 +193,7 @@ impl<'database> Page<'database> {
         let start_of_data = self.data_offset - row_bytes.len();
         self.data[start_of_data..self.data_offset].copy_from_slice(&row_bytes);
         self.data_offset -= row_bytes.len();
-        self.num_rows += 1;
+        self.number_of_records += 1;
 
         // reserve free slot for this row
         self.allocate_slot(start_of_data, row_bytes.len() as u16);
@@ -224,7 +224,7 @@ impl<'database> Page<'database> {
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = vec![0u8; self.layout.page_size()];
         // Number of rows 2 Bytes
-        buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_ROW_OFFSET].copy_from_slice(&self.num_rows.to_be_bytes());
+        buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_ROW_OFFSET].copy_from_slice(&self.number_of_records.to_be_bytes());
         // Offset 4 Bytes
         let offset_bytes = (self.data_offset as u32).to_be_bytes();
         buf[PageDataLayout::INDEX_ROW_OFFSET..PageDataLayout::INDEX_PAGE_ID].copy_from_slice(&offset_bytes);
@@ -273,7 +273,7 @@ impl<'database> Page<'database> {
 
         Self {
             layout,
-            num_rows,
+            number_of_records: num_rows,
             data_offset: offset as usize,
             page_id,
             data,

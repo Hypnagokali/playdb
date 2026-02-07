@@ -9,14 +9,18 @@ pub trait Store {
     // fn store_layout(&self, layout: &PageDataLayout, database: &Database);
     // fn load_layout(&self, database: &Database) -> PageDataLayout;
     fn read_metadata(&self, layout: &PageDataLayout, table: &Table) -> Result<PageFileMetadata, StoreError>;
-    fn write_metadata(&self, layout: &PageDataLayout, metadata: &PageFileMetadata, table: &Table) -> Result<(), StoreError>;
     fn read_page<'db>(&self, layout: &'db PageDataLayout, page_id: i32, table: &Table) -> Result<Page<'db>, StoreError>;
     fn write_page(&self, layout: &PageDataLayout, page: &Page, table: &Table) -> Result<(), StoreError>;
     fn allocate_page<'db>(&self, layout: &'db PageDataLayout, table: &Table) -> Result<Page<'db>, StoreError>;
-    fn page_iterator<'db>(&'db self, layout: &'db PageDataLayout, table: &'db Table) -> Result<PageIterator<'db, Self>, StoreError>;
+    fn page_iterator<'database>(&'database self, layout: &'database PageDataLayout, table: &'database crate::table::table::Table) -> Result<PageIterator<'database, Self>, StoreError> 
+    where
+        Self: Sized
+    {
+        Ok(PageIterator::new(table, self, layout))
+    }
 }
 
-pub struct PageIterator<'db, S: Store + ?Sized> {
+pub struct PageIterator<'db, S: Store> {
     layout: &'db PageDataLayout,
     store: &'db S,
     table: &'db Table,

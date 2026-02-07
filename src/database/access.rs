@@ -53,7 +53,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
         // Iterate over all pages and collect rows
         for page_id in 0..total_pages {
             let page = self.store.read_page(self.layout, page_id, self.table)?;
-            let page_iterator = PageRowIterator::new(&page, &self.table.schema);
+            let page_iterator = PageRowIterator::new(&page, self.table.schema());
 
             for row in page_iterator {
                 rows.push(row);
@@ -66,7 +66,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
     // Currently maximally naive insert implementation
     // Should be refactored, so that FSM is used to find pages with free space
     pub fn insert(&self, row: &Row) -> Result<(), TableAccessError> {
-        row.validate(&self.table.schema)?;
+        row.validate(self.table.schema())?;
 
         let page_iterator = self.store.page_iterator(self.layout, self.table)
             .map_err(|_| TableAccessError::InsertRowError("Cannot retrieve page iterator".to_string()))?;
