@@ -180,13 +180,17 @@ impl<'database> Page<'database> {
         new
     }
 
-    pub fn space_remaining(&self) -> usize {
+    fn space_remaining(&self) -> usize {
         // page_data_size - row_data_size - (free_slots + size of next free_slot entry)
         self.layout.page_data_size() - self.row_data_size() - PageDataLayout::SLOT_SIZE * (self.slots.len() + 1)
     }
 
-    pub fn insert_row(&mut self, row_bytes: Vec<u8>) -> Result<(), PageError> {
-        if row_bytes.len() > self.space_remaining() || row_bytes.len() > PageDataLayout::MAX_ROW_LENGTH as usize {
+    pub fn can_insert(&self, row_bytes: &Vec<u8>) -> bool {
+        row_bytes.len() <= self.space_remaining() && row_bytes.len() <= PageDataLayout::MAX_ROW_LENGTH as usize
+    }
+
+    pub fn insert_record(&mut self, row_bytes: Vec<u8>) -> Result<(), PageError> {
+        if !self.can_insert(&row_bytes) {
             return Err(PageError::InsertRowError);
         }
 
@@ -308,7 +312,7 @@ mod tests {
 
         // insert 7 bytes
         let row = vec![1, 2, 3, 4, 5, 6, 7];
-        page.insert_row(row.clone()).unwrap();
+        page.insert_record(row.clone()).unwrap();
 
         // 32 - 14(header) = 18
         assert_eq!(page.data.len(), 18);
@@ -334,7 +338,7 @@ mod tests {
 
         // insert 7 bytes
         let row = vec![1, 2, 3, 4, 5, 6, 7];
-        page.insert_row(row.clone()).unwrap();
+        page.insert_record(row.clone()).unwrap();
 
         // act: serialize
         let bytes = page.serialize();

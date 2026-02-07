@@ -74,8 +74,8 @@ impl<'db, S: Store> TableAccess<'db, S> {
         let mut inserted = false;
         for mut page in page_iterator {
             let row_data = row.serialize();
-            if page.space_remaining() >= row_data.len() {
-                page.insert_row(row_data)?;
+            if page.can_insert(&row_data) {
+                page.insert_record(row_data)?;
                 self.store.write_page(self.layout, &page, self.table)
                     .map_err(|_| TableAccessError::InsertRowError("Cannot write page".to_string()))?;
 
@@ -90,7 +90,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
                 .map_err(|_| TableAccessError::InsertRowError("Cannot allocate page".to_string()))?;
 
             let row_data = row.serialize();
-            new_page.insert_row(row_data)?;
+            new_page.insert_record(row_data)?;
 
             self.store.write_page(self.layout, &new_page, self.table)
                 .map_err(|_| TableAccessError::InsertRowError("Cannot write new allocated page".to_string()))?;

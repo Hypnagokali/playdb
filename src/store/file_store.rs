@@ -103,6 +103,31 @@ mod tests {
 
     use crate::{data::page::PageDataLayout, store::{Store, file_store::FileStore}, table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}};
 
+    struct Sequence {
+            col_id: i32,
+            current: i32,
+    }
+
+    impl Sequence {
+        fn serialize(&self) -> Vec<u8> {
+            let mut buf = [0; 8];
+            buf[0..4].copy_from_slice(&self.col_id.to_be_bytes());
+            buf[4..8].copy_from_slice(&self.current.to_be_bytes());
+            buf.to_vec()
+        }
+
+        fn deserialize(data: &[u8]) -> Self {
+            let col_id = i32::from_be_bytes(data[0..4].try_into().unwrap());
+            let current = i32::from_be_bytes(data[4..8].try_into().unwrap());
+
+            Self {
+                col_id,
+                current,
+            }
+        }
+    }
+
+
 
     #[test]
     fn should_allocate_and_write_page() {
@@ -124,7 +149,7 @@ mod tests {
             Cell::Int(42)
         ]);
 
-        new_page.insert_row(row.serialize()).unwrap();
+        new_page.insert_record(row.serialize()).unwrap();
 
         store.write_page(&layout, &new_page, &table).unwrap();
 
@@ -163,7 +188,7 @@ mod tests {
             Cell::Int(42)
         ]);
 
-        second_page.insert_row(row.serialize()).unwrap();
+        second_page.insert_record(row.serialize()).unwrap();
         store.write_page(&layout, &second_page, &table).unwrap();
         let loaded_page = store.read_page(&layout, 2, &table).unwrap();
 
@@ -171,6 +196,37 @@ mod tests {
 
         assert_eq!(row.cells().len(), 1);
         matches!(row.cells().get(0).unwrap(), Cell::Int(42));
+    }
+
+    #[test]
+    fn should_be_able_to_store_arbitrary_data() {
+        let dir = tempdir().unwrap();
+        let store = FileStore::new(dir.path());
+
+        let layout = PageDataLayout::new(128).unwrap();
+
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int)
+        ]);
+        let table = Table::new(1, "test".to_owned(), schema);
+
+        // Create page for sequences
+        let mut seq_page = store.allocate_page(&layout, &table).unwrap();
+
+        let seq = Sequence {
+            col_id: 1,
+            current: 3,
+        };
+
+        seq_page.insert_record(seq.serialize()).unwrap();
+        store.write_page(&layout, &seq_page, &table).unwrap();
+
+        let loaded_page = store.read_page(&layout, 1, &table).unwrap();
+
+        let seq_loaded: Sequence = Sequence::deserialize(loaded_page.row_data());
+
+        assert_eq!(seq_loaded.col_id, 1);
+        assert_eq!(seq_loaded.current, 3);
     }
 }
 
