@@ -135,5 +135,42 @@ mod tests {
         assert_eq!(row.cells().len(), 1);
         matches!(row.cells().get(0).unwrap(), Cell::Int(42));
     }
+
+    #[test]
+    fn should_can_allocate_twice() {
+        let dir = tempdir().unwrap();
+        let store = FileStore::new(dir.path());
+
+        let layout = PageDataLayout::new(128).unwrap();
+
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int)
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+
+        // Create first page (stays empty)
+        let first_page = store.allocate_page(&layout, &table).unwrap();
+        assert_eq!(first_page.page_id(), 1);
+
+        store.write_page(&layout, &first_page, &table).unwrap();
+
+        // Create second page with a row
+        let mut second_page = store.allocate_page(&layout, &table).unwrap();
+        assert_eq!(second_page.page_id(), 2);
+
+        let row = Row::new(vec![
+            Cell::Int(42)
+        ]);
+
+        second_page.insert_row(row.serialize()).unwrap();
+        store.write_page(&layout, &second_page, &table).unwrap();
+        let loaded_page = store.read_page(&layout, 2, &table).unwrap();
+
+        let row = Row::deserialize(loaded_page.row_data(), table.schema()).0;
+
+        assert_eq!(row.cells().len(), 1);
+        matches!(row.cells().get(0).unwrap(), Cell::Int(42));
+    }
 }
 
