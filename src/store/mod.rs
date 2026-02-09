@@ -24,7 +24,7 @@ pub struct PageIterator<'db, S: Store> {
     layout: &'db PageDataLayout,
     store: &'db S,
     table: &'db Table,
-    current_page: i32,
+    current_page_id: i32,
     total_pages: i32,
 }
 
@@ -37,7 +37,7 @@ impl<'db, S: Store> PageIterator<'db, S> {
             table,
             layout,
             store,
-            current_page: 0,
+            current_page_id: 1,
             total_pages,
         }
     }
@@ -47,12 +47,12 @@ impl<'db, S: Store> Iterator for PageIterator<'db, S> {
     type Item = Page<'db>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current_page >= self.total_pages {
+        if self.current_page_id > self.total_pages {
             return None;
         }
-        let page = self.store.read_page(self.layout, self.current_page, self.table).unwrap();
+        let page = self.store.read_page(self.layout, self.current_page_id, self.table).unwrap();
 
-        self.current_page += 1;
+        self.current_page_id += 1;
         Some(page)
     }
 }

@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{data::page::{PageDataLayout, PageError}, store::{PageRowIterator, Store}, table::table::{Row, RowValidationError, Table}};
+use crate::{data::page::{PageDataLayout, PageError}, store::{PageIterator, PageRowIterator, Store}, table::table::{Row, RowValidationError, Table}};
 
 pub struct TableAccess<'db, S: ?Sized> {
     table: &'db Table,
@@ -47,12 +47,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
         let mut rows = Vec::new();
 
         // Read metadata to know how many pages exist
-        let metadata = self.store.read_metadata(self.layout, self.table)?;
-        let total_pages = metadata.number_of_pages();
-
-        // Iterate over all pages and collect rows
-        for page_id in 0..total_pages {
-            let page = self.store.read_page(self.layout, page_id, self.table)?;
+        for page in PageIterator::new(self.table, self.store, self.layout) {
             let page_iterator = PageRowIterator::new(&page, self.table.schema());
 
             for row in page_iterator {
@@ -98,4 +93,40 @@ impl<'db, S: Store> TableAccess<'db, S> {
 
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use crate::{data::page::PageDataLayout, database::access::TableAccess, store::file_store::FileStore, table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}};
+
+
+    #[test]
+    fn should_insert_two_rows() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "name", ColumnType::Varchar(10))
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(64).unwrap();
+
+        let access = TableAccess::new(&table, &store, &layout);
+
+        let first_row = Row::new(vec![
+            Cell::Varchar("Hans".to_owned())
+        ]);
+        let second_row = Row::new(vec![
+            Cell::Varchar("Rabbit".to_owned())
+        ]);
+
+        access.insert(&first_row).unwrap();
+        access.insert(&second_row).unwrap();
+
+        let rows = access.load_all().unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
 }

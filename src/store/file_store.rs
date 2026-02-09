@@ -65,12 +65,12 @@ impl<'a> Store for FileStore<'a> {
             .read(true)
             .open(self.base_path.join(table.file_path()))?;
 
-        file.seek(SeekFrom::Start((layout.metadata_size() + page_id as usize * layout.page_size()) as u64))?;
+        let page_pos = page_id - 1;
+        file.seek(SeekFrom::Start((layout.metadata_size() + page_pos as usize * layout.page_size()) as u64))?;
     
         file.read_exact(&mut page_data)?;
 
         let p = Page::deserialize(&page_data, layout);
-        println!("Page loaded: number {}, rows {}, offset {}", p.page_id(), p.num_rows(), p.data_offset());
         Ok(p)
     }
 
@@ -80,7 +80,8 @@ impl<'a> Store for FileStore<'a> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(self.base_path.join(table.file_path()))?;
-        file.seek(SeekFrom::Start((layout.metadata_size() + page.page_id() as usize * layout.page_size()) as u64))?;
+        let page_pos = page.page_id() - 1;
+        file.seek(SeekFrom::Start((layout.metadata_size() + page_pos as usize * layout.page_size()) as u64))?;
         file.write_all(&data)?;
         Ok(())
     }
@@ -101,7 +102,7 @@ impl<'a> Store for FileStore<'a> {
 mod tests {
     use tempfile::tempdir;
 
-    use crate::{data::page::PageDataLayout, store::{Store, file_store::FileStore}, table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}};
+    use crate::{data::page::PageDataLayout, store::{PageIterator, Store, file_store::FileStore}, table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}};
 
     struct Sequence {
             col_id: i32,
@@ -227,6 +228,37 @@ mod tests {
 
         assert_eq!(seq_loaded.col_id, 1);
         assert_eq!(seq_loaded.current, 3);
+    }
+
+    #[test]
+    fn should_iterate_over_pages() {
+        let dir = tempdir().unwrap();
+        let store = FileStore::new(dir.path());
+
+        let layout = PageDataLayout::new(32).unwrap();
+
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int)
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+
+        let mut new_page = store.allocate_page(&layout, &table).unwrap();
+        assert_eq!(new_page.page_id(), 1);
+
+        let row = Row::new(vec![
+            Cell::Int(42)
+        ]);
+
+        new_page.insert_record(row.serialize()).unwrap();
+        store.write_page(&layout, &new_page, &table).unwrap();
+
+        let mut iter = PageIterator::new(&table, &store, &layout);
+
+        let page = iter.next().unwrap();
+
+        assert_eq!(page.page_id(), 1);
+        matches!(page.data_offset(), 28);
     }
 }
 

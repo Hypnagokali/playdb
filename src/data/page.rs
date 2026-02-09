@@ -161,6 +161,10 @@ impl<'database> Page<'database> {
         self.layout.page_data_size() - self.data_offset
     }
 
+    pub fn slot_size(&self) -> usize {
+        self.slots.len() * PageDataLayout::SLOT_SIZE
+    }
+
     pub fn num_rows(&self) -> u16 {
         self.number_of_records
     }
@@ -173,16 +177,9 @@ impl<'database> Page<'database> {
         self.page_id = page_id;
     }
 
-    // There should be somewhere an allocation method for a new page
-    pub fn create_next(&self) -> Self {
-        let mut new = Self::new(self.layout);
-        new.page_id = self.page_id + 1;
-        new
-    }
-
     fn space_remaining(&self) -> usize {
         // page_data_size - row_data_size - (free_slots + size of next free_slot entry)
-        self.layout.page_data_size() - self.row_data_size() - PageDataLayout::SLOT_SIZE * (self.slots.len() + 1)
+        self.layout.page_data_size() - self.row_data_size() - self.slot_size()
     }
 
     pub fn can_insert(&self, row_bytes: &Vec<u8>) -> bool {
@@ -253,6 +250,7 @@ impl<'database> Page<'database> {
             buf[PageDataLayout::INDEX_ROW_OFFSET..PageDataLayout::INDEX_PAGE_ID].try_into().unwrap()
         
         );
+
         let page_id = i32::from_be_bytes(
             buf[PageDataLayout::INDEX_PAGE_ID..PageDataLayout::INDEX_FREE_SLOTS_OFFSET].try_into().unwrap()
         );
@@ -335,6 +333,7 @@ mod tests {
     fn should_serialize_and_deserialize_correctly() {
         let layout = PageDataLayout::new(32).unwrap();
         let mut page = Page::new(&layout);
+        page.set_page_id(1);
 
         // insert 7 bytes
         let row = vec![1, 2, 3, 4, 5, 6, 7];
@@ -344,6 +343,8 @@ mod tests {
         let bytes = page.serialize();
 
         let deserialized_page = Page::deserialize(&bytes, &layout);
+
+        assert_eq!(deserialized_page.page_id, 1);
         // 32 - 14(header) = 18
         assert_eq!(deserialized_page.data.len(), 18);
         assert_eq!(deserialized_page.slots.len(), 1);
