@@ -177,9 +177,19 @@ impl<'database> Page<'database> {
         self.page_id = page_id;
     }
 
+    fn max_fragmented_free_space(&self) -> usize {
+        self.slots.iter()
+            .filter(|s| s.deleted)
+            .map(|s| s.record_length)
+            .max()
+            .unwrap_or(0) as usize
+    }
+
     fn space_remaining(&self) -> usize {
-        // page_data_size - row_data_size - (free_slots + size of next free_slot entry)
-        self.layout.page_data_size() - self.row_data_size() - self.slot_size()
+        std::cmp::max(
+            // page_data_size - row_data_size - (free_slots + size of next free_slot entry)
+            self.layout.page_data_size() - self.row_data_size() - self.slot_size(),
+            self.max_fragmented_free_space())
     }
 
     pub fn can_insert(&self, row_bytes: &Vec<u8>) -> bool {
@@ -191,13 +201,21 @@ impl<'database> Page<'database> {
             return Err(PageError::InsertRowError);
         }
 
-        let start_of_data = self.data_offset - row_bytes.len();
-        self.data[start_of_data..self.data_offset].copy_from_slice(&row_bytes);
-        self.data_offset -= row_bytes.len();
-        self.number_of_records += 1;
+        let slot = self.slots.iter_mut()
+            .find(|s| s.record_length as usize >= row_bytes.len() && s.deleted);
 
-        // reserve free slot for this row
-        self.allocate_slot(start_of_data, row_bytes.len() as u16);
+        if let Some(slot) = slot {
+            self.data[slot.page_offset..slot.page_offset + row_bytes.len()].copy_from_slice(&row_bytes);
+            slot.deleted = false;
+        } else {
+            let start_of_data = self.data_offset - row_bytes.len();
+            self.data[start_of_data..self.data_offset].copy_from_slice(&row_bytes);
+            self.data_offset -= row_bytes.len();
+            // reserve free slot for this row
+            self.allocate_slot(start_of_data, row_bytes.len() as u16);
+        }
+    
+        self.number_of_records += 1;
         
         Ok(())
     }
