@@ -201,18 +201,36 @@ impl<'database> Page<'database> {
             return Err(PageError::InsertRowError);
         }
 
-        let slot = self.slots.iter_mut()
-            .find(|s| s.record_length as usize >= row_bytes.len() && s.deleted);
+        let new_record_len = row_bytes.len() as u16; // size already checked
 
-        if let Some(slot) = slot {
-            self.data[slot.page_offset..slot.page_offset + row_bytes.len()].copy_from_slice(&row_bytes);
-            slot.deleted = false;
+        let slot = self.slots.iter_mut()
+            .find(|s| s.record_length >= new_record_len && s.deleted);
+
+
+        let (new_slot_len, slot_data_start_offset) = if let Some(slot) = slot {
+            let end_of_data = slot.page_offset + row_bytes.len();
+            self.data[slot.page_offset..end_of_data].copy_from_slice(&row_bytes);
+
+            // Need a new slot if the length of the inserted record is not as long as the slot
+            let new_slot_len = new_record_len - slot.record_length;
+
+            if new_slot_len == 0 {
+                slot.deleted = false;
+            } else {
+                slot.record_length = new_record_len;
+            }
+
+            (new_slot_len, end_of_data)
         } else {
             let start_of_data = self.data_offset - row_bytes.len();
             self.data[start_of_data..self.data_offset].copy_from_slice(&row_bytes);
             self.data_offset -= row_bytes.len();
-            // reserve free slot for this row
-            self.allocate_slot(start_of_data, row_bytes.len() as u16);
+
+            (row_bytes.len() as u16, start_of_data)
+        };
+
+        if new_slot_len > 0 {
+            self.allocate_slot(slot_data_start_offset, new_record_len);
         }
     
         self.number_of_records += 1;
