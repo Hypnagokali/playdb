@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+#[derive(Debug)]
 pub struct PageDataLayout {
     page_size: usize,
 }
@@ -53,6 +54,7 @@ impl PageDataLayout {
 
 }
 
+#[derive(Debug)]
 pub struct PageFileMetadata {
     next_id: i32, // There is currently just a signed int for ids
     number_of_pages: i32, // because of next_id being i32
@@ -95,19 +97,32 @@ impl PageFileMetadata {
     }
 }
 
+#[derive(Debug)]
 struct Slot {
     record_length: u16,
     page_offset: usize, // stored as u32
     deleted: bool,
 }
 
-pub struct RecordDataIterator<'a> {
+#[derive(Debug)]
+pub struct Record<'a> {
+    record_index: usize,
+    data: &'a [u8]
+}
+
+impl<'a> Record<'a> {
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+}
+
+pub struct RecordIterator<'a> {
     data: &'a [u8],
     slots: &'a Vec<Slot>,
     slot_index: usize,
 }
 
-impl<'a> RecordDataIterator<'a> {
+impl<'a> RecordIterator<'a> {
 
     pub fn new(page: &'a Page) -> Self {
         Self {
@@ -118,8 +133,8 @@ impl<'a> RecordDataIterator<'a> {
     }
 }
 
-impl<'a> Iterator for RecordDataIterator<'a> {
-    type Item = &'a [u8];
+impl<'a> Iterator for RecordIterator<'a> {
+    type Item = Record<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut found = None;
@@ -128,7 +143,12 @@ impl<'a> Iterator for RecordDataIterator<'a> {
             let slot = &self.slots[self.slot_index];
 
             if !slot.deleted {
-                found = Some(&self.data[slot.page_offset..slot.page_offset + slot.record_length as usize]);
+                let record = Record {
+                    record_index: self.slot_index,
+                    data: &self.data[slot.page_offset..slot.page_offset + slot.record_length as usize],
+                };
+
+                found = Some(record);
             }
 
             self.slot_index += 1;
@@ -150,6 +170,7 @@ impl<'a> Iterator for RecordDataIterator<'a> {
 // row2
 // row1
 // rows (go upwards)
+#[derive(Debug)]
 pub struct Page<'database> {
     data: Vec<u8>,
     slots: Vec<Slot>,
@@ -188,8 +209,8 @@ impl<'database> Page<'database> {
         }
     }
 
-    pub fn data_iterator(&self) -> RecordDataIterator<'_> {
-        RecordDataIterator::new(self)
+    pub fn record_iterator(&self) -> RecordIterator<'_> {
+        RecordIterator::new(self)
     }
 
     pub fn row_data(&self) -> &[u8] {
@@ -319,7 +340,10 @@ impl<'database> Page<'database> {
         let free_slots_offset_bytes = ((self.slots.len() * PageDataLayout::SLOT_SIZE) as i32).to_be_bytes();
         buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET..PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4]
             .copy_from_slice(&free_slots_offset_bytes);
-        
+
+        buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4..self.layout.page_size()].copy_from_slice(&self.data);
+
+        // serialize Slots:
         for (i, slot) in self.slots.iter().enumerate() {
             let next_free_slots_start = PageDataLayout::INDEX_FREE_SLOTS_START + (i * PageDataLayout::SLOT_SIZE);
             let offset_of_data_index = next_free_slots_start + 1;
@@ -333,10 +357,9 @@ impl<'database> Page<'database> {
                 .copy_from_slice(&(slot.page_offset as u32).to_be_bytes());
             // length
             buf[length_index..length_end]
-                .copy_from_slice(&(0u16).to_be_bytes());
+                .copy_from_slice(&(slot.record_length).to_be_bytes());
         }
 
-        buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4..self.layout.page_size()].copy_from_slice(&self.data);
         buf
     }
 
@@ -359,17 +382,19 @@ impl<'database> Page<'database> {
         ) as usize;
 
         let data = buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4..layout.page_size()].to_vec();
+
         let free_slots: Vec<Slot> = data[0..free_slots_offset].to_vec()
-            .windows(7)
-            .map(|window| {
-                let deleted = if window[0] == 1 { true } else { false };
-                let offset = u32::from_be_bytes(window[1..5].try_into().unwrap()) as usize;
-                let length = u16::from_be_bytes(window[5..7].try_into().unwrap());
-                Slot {
+            .chunks_exact(7)
+            .map(|chunk| {
+                let deleted = if chunk[0] == 1 { true } else { false };
+                let offset = u32::from_be_bytes(chunk[1..5].try_into().unwrap()) as usize;
+                let length = u16::from_be_bytes(chunk[5..7].try_into().unwrap());
+                let slot = Slot {
                     page_offset: offset,
                     record_length: length,
                     deleted,
-                }
+                };
+                slot
             }).collect();
 
         Self {
@@ -447,8 +472,8 @@ mod tests {
         // 32 - 14(header) = 18
         assert_eq!(deserialized_page.data.len(), 18);
         assert_eq!(deserialized_page.slots.len(), 1);
-        // Slot points to offset 11, but no isn't deleted
-        let slot_option = page.slots.get(0);
+        // Slot points to offset 11 and it isn't deleted
+        let slot_option = deserialized_page.slots.get(0);
         assert!(slot_option.is_some());
         let slot = slot_option.unwrap();
         assert_eq!(slot.deleted, false);
@@ -461,10 +486,40 @@ mod tests {
     }
 
     #[test]
+    fn should_serialize_and_deserialize_correctly_multiple_inserts() {
+        let layout = PageDataLayout::new(64).unwrap();
+        let mut page = Page::new(&layout);
+        page.set_page_id(1);
+
+        page.insert_record(vec![1, 2, 3]).unwrap();
+        page.insert_record(vec![4, 5, 6]).unwrap();
+        page.insert_record(vec![7, 8, 9]).unwrap();
+
+        // act: serialize + deserialize
+        let bytes = page.serialize();
+        let deserialized_page = Page::deserialize(&bytes, &layout);
+
+        assert_eq!(deserialized_page.page_id, 1);
+        // 64 - 14(header) = 50
+        assert_eq!(deserialized_page.data.len(), 50);
+        assert_eq!(deserialized_page.slots.len(), 3);
+
+        let slot_option = page.slots.get(2);
+        assert!(slot_option.is_some());
+        let slot = slot_option.unwrap();
+        assert_eq!(slot.deleted, false);
+        assert_eq!(slot.record_length, 3);
+        // 50 - 9 = 41
+        assert_eq!(slot.page_offset, 41);
+
+        assert_eq!(deserialized_page.row_data_size(), 9);
+    }
+
+    #[test]
     fn data_iterator_should_return_none_if_no_data_present() {
         let layout = PageDataLayout::new(32).unwrap();
         let page = Page::new(&layout);
-        let record_data = page.data_iterator().next();
+        let record_data = page.record_iterator().next();
               
         assert!(record_data.is_none());
     }
@@ -476,12 +531,12 @@ mod tests {
         page.insert_record(vec![1, 2, 3]).unwrap();
         page.insert_record(vec![4, 5, 6]).unwrap();
 
-        let mut rec_iterator = page.data_iterator();
+        let mut rec_iterator = page.record_iterator();
         let mut record_data = rec_iterator.next();        
-        assert!(matches!(record_data, Some(data) if data == &[1, 2, 3]));
+        assert!(matches!(record_data, Some(record) if record.data() == &[1, 2, 3]));
 
         record_data = rec_iterator.next();
-        assert!(matches!(record_data, Some(data) if data == &[4, 5, 6]));
+        assert!(matches!(record_data, Some(record) if record.data() == &[4, 5, 6]));
         
         record_data = rec_iterator.next();
         assert!(record_data.is_none());
@@ -495,9 +550,9 @@ mod tests {
         page.insert_record(vec![4, 5, 6]).unwrap();
         page.slots[0].deleted = true;
 
-        let mut rec_iterator = page.data_iterator();
+        let mut rec_iterator = page.record_iterator();
         let mut record_data = rec_iterator.next();              
-        assert!(matches!(record_data, Some(data) if data == &[4, 5, 6]));
+        assert!(matches!(record_data, Some(record) if record.data() == &[4, 5, 6]));
 
         record_data = rec_iterator.next();              
         assert!(record_data.is_none());

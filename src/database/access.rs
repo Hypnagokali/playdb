@@ -48,10 +48,10 @@ impl<'db, S: Store> TableAccess<'db, S> {
 
         // Read metadata to know how many pages exist
         for page in PageIterator::new(self.table, self.store, self.layout) {
-            let page_iterator = PageRowIterator::new(&page, self.table.schema());
+            let row_iterator = PageRowIterator::new(&page, self.table.schema());
 
-            for row in page_iterator {
-                rows.push(row);
+            for record_row in row_iterator {
+                rows.push(record_row.1);
             }
         }
 

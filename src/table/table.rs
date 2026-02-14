@@ -52,7 +52,7 @@ impl Row {
     }
 
     // ToDo: return Result<Row, RowDeserializationError> instead of using unwrap
-    pub fn deserialize(row_data: &[u8], schema: &TableSchema) -> (Self, usize) {
+    pub fn deserialize(row_data: &[u8], schema: &TableSchema) -> Self {
         let mut cells = Vec::new();
         let mut offset = 0;
         for col in schema.columns.iter() {
@@ -61,8 +61,7 @@ impl Row {
             cells.push(cell);
         }
 
-        // TODO: offset won't be needed anymore as soon as the RowIterator uses the slots instead of a raw offset
-        (Row { cells }, offset)
+        Row { cells }
     }
 
     pub fn validate(&self, schema: &TableSchema) -> Result<(), RowValidationError> {
@@ -227,7 +226,7 @@ mod tests {
 
         let serialized = row.serialize();
 
-        let deserialized_row = Row::deserialize(&serialized, &schema).0;
+        let deserialized_row = Row::deserialize(&serialized, &schema);
         let cells = deserialized_row.cells;
 
         assert!(matches!(&cells[0], Cell::Int(42)));

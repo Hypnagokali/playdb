@@ -128,8 +128,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn should_allocate_and_write_page() {
         let dir = tempdir().unwrap();
@@ -156,7 +154,7 @@ mod tests {
 
         let loaded_page = store.read_page(&layout, 1, &table).unwrap();
 
-        let row = Row::deserialize(loaded_page.row_data(), table.schema()).0;
+        let row = Row::deserialize(loaded_page.row_data(), table.schema());
 
         assert_eq!(row.cells().len(), 1);
         matches!(row.cells().get(0).unwrap(), Cell::Int(42));
@@ -193,7 +191,7 @@ mod tests {
         store.write_page(&layout, &second_page, &table).unwrap();
         let loaded_page = store.read_page(&layout, 2, &table).unwrap();
 
-        let row = Row::deserialize(loaded_page.row_data(), table.schema()).0;
+        let row = Row::deserialize(loaded_page.row_data(), table.schema());
 
         assert_eq!(row.cells().len(), 1);
         matches!(row.cells().get(0).unwrap(), Cell::Int(42));
