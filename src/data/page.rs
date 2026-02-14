@@ -15,6 +15,7 @@ impl PageDataLayout {
     const INDEX_ROW_OFFSET: usize = 2;
     const INDEX_PAGE_ID: usize = 6;
     const INDEX_FREE_SLOTS_OFFSET: usize = 10;
+    const INDEX_FREE_SLOTS_START: usize = 14;
 
     // table meta data: 4 bytes next_id, 4 bytes number_of_pages
     pub const META_DATA_SIZE: usize = 8;
@@ -100,6 +101,43 @@ struct Slot {
     deleted: bool,
 }
 
+pub struct RecordDataIterator<'a> {
+    data: &'a [u8],
+    slots: &'a Vec<Slot>,
+    slot_index: usize,
+}
+
+impl<'a> RecordDataIterator<'a> {
+
+    pub fn new(page: &'a Page) -> Self {
+        Self {
+            data: &page.data,
+            slots: &page.slots,
+            slot_index: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for RecordDataIterator<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut found = None;
+
+        while self.slot_index < self.slots.len() && found.is_none() {
+            let slot = &self.slots[self.slot_index];
+
+            if !slot.deleted {
+                found = Some(&self.data[slot.page_offset..slot.page_offset + slot.record_length as usize]);
+            }
+
+            self.slot_index += 1;
+        }
+
+        found
+    }
+}
+
 // Page Layout
 // ------------
 // Header
@@ -148,6 +186,10 @@ impl<'database> Page<'database> {
             slots: Vec::new(),
             slots_offset: 0,
         }
+    }
+
+    pub fn data_iterator(&self) -> RecordDataIterator<'_> {
+        RecordDataIterator::new(self)
     }
 
     pub fn row_data(&self) -> &[u8] {
@@ -241,38 +283,59 @@ impl<'database> Page<'database> {
     fn allocate_slot(&mut self, page_offset: usize, record_length: u16) {
         self.slots.push(Slot { record_length, page_offset, deleted: false });
 
-        let offset_index = self.slots_offset + 1; // after delete
-        // TODO: SOMETHING WRONG ()
-        let length_index = self.slots_offset + PageDataLayout::SLOT_RECORD_LENGTH_INDEX;
-        let length_end = length_index + 2;
+        // let offset_index = self.slots_offset + 1; // after the delete flag index
+        // let length_index = self.slots_offset + PageDataLayout::SLOT_RECORD_LENGTH_INDEX;
+        // let length_end = length_index + 2;
 
-        // deleted flag
-        self.data[self.slots_offset] = 0;
-        // offset
-        self.data[offset_index..length_index]
-            .copy_from_slice(&(page_offset as u32).to_be_bytes());
-        // length
-        self.data[length_index..length_end]
-            .copy_from_slice(&(0u16).to_be_bytes());
+        // // deleted flag
+        // self.data[self.slots_offset] = 0;
+        // // offset
+        // self.data[offset_index..length_index]
+        //     .copy_from_slice(&(page_offset as u32).to_be_bytes());
+        // // length
+        // self.data[length_index..length_end]
+        //     .copy_from_slice(&(0u16).to_be_bytes());
 
-        self.slots_offset += PageDataLayout::SLOT_SIZE;
+        // self.slots_offset += PageDataLayout::SLOT_SIZE;
     }
 
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = vec![0u8; self.layout.page_size()];
         // Number of rows 2 Bytes
-        buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_ROW_OFFSET].copy_from_slice(&self.number_of_records.to_be_bytes());
+        buf[PageDataLayout::INDEX_NUMBER_ROWS..PageDataLayout::INDEX_ROW_OFFSET]
+            .copy_from_slice(&self.number_of_records.to_be_bytes());
+        
         // Offset 4 Bytes
         let offset_bytes = (self.data_offset as u32).to_be_bytes();
-        buf[PageDataLayout::INDEX_ROW_OFFSET..PageDataLayout::INDEX_PAGE_ID].copy_from_slice(&offset_bytes);
+        buf[PageDataLayout::INDEX_ROW_OFFSET..PageDataLayout::INDEX_PAGE_ID]
+            .copy_from_slice(&offset_bytes);
+
         // PageId 4 Bytes
         let page_id_bytes = self.page_id.to_be_bytes();
-        buf[PageDataLayout::INDEX_PAGE_ID..PageDataLayout::INDEX_FREE_SLOTS_OFFSET].copy_from_slice(&page_id_bytes);
+        buf[PageDataLayout::INDEX_PAGE_ID..PageDataLayout::INDEX_FREE_SLOTS_OFFSET]
+            .copy_from_slice(&page_id_bytes);
+
         // Free slots offset 4 Bytes
-        let free_slots_offset_bytes = (self.slots_offset as i32).to_be_bytes();
-        buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET..PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4].copy_from_slice(&free_slots_offset_bytes);
+        let free_slots_offset_bytes = ((self.slots.len() * PageDataLayout::SLOT_SIZE) as i32).to_be_bytes();
+        buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET..PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4]
+            .copy_from_slice(&free_slots_offset_bytes);
         
-        // Free slots are redundant and live also in the data array, so it's only needed to serialize the whole data array
+        for (i, slot) in self.slots.iter().enumerate() {
+            let next_free_slots_start = PageDataLayout::INDEX_FREE_SLOTS_START + (i * PageDataLayout::SLOT_SIZE);
+            let offset_of_data_index = next_free_slots_start + 1;
+            let length_index = next_free_slots_start + PageDataLayout::SLOT_RECORD_LENGTH_INDEX;
+            let length_end = length_index + 2;
+            
+            // deleted flag
+            buf[next_free_slots_start] = 0;
+            // offset
+            buf[offset_of_data_index..length_index]
+                .copy_from_slice(&(slot.page_offset as u32).to_be_bytes());
+            // length
+            buf[length_index..length_end]
+                .copy_from_slice(&(0u16).to_be_bytes());
+        }
+
         buf[PageDataLayout::INDEX_FREE_SLOTS_OFFSET + 4..self.layout.page_size()].copy_from_slice(&self.data);
         buf
     }
@@ -395,6 +458,49 @@ mod tests {
         assert_eq!(deserialized_page.row_data_size(), 7);
         let data = deserialized_page.row_data();
         assert_eq!(data, row);
+    }
+
+    #[test]
+    fn data_iterator_should_return_none_if_no_data_present() {
+        let layout = PageDataLayout::new(32).unwrap();
+        let page = Page::new(&layout);
+        let record_data = page.data_iterator().next();
+              
+        assert!(record_data.is_none());
+    }
+
+    #[test]
+    fn data_iterator_should_iterate_over_record_data() {
+        let layout = PageDataLayout::new(32).unwrap();
+        let mut page = Page::new(&layout);
+        page.insert_record(vec![1, 2, 3]).unwrap();
+        page.insert_record(vec![4, 5, 6]).unwrap();
+
+        let mut rec_iterator = page.data_iterator();
+        let mut record_data = rec_iterator.next();        
+        assert!(matches!(record_data, Some(data) if data == &[1, 2, 3]));
+
+        record_data = rec_iterator.next();
+        assert!(matches!(record_data, Some(data) if data == &[4, 5, 6]));
+        
+        record_data = rec_iterator.next();
+        assert!(record_data.is_none());
+    }
+
+    #[test]
+    fn data_iterator_should_not_return_deleted_data() {
+        let layout = PageDataLayout::new(32).unwrap();
+        let mut page = Page::new(&layout);
+        page.insert_record(vec![1, 2, 3]).unwrap();
+        page.insert_record(vec![4, 5, 6]).unwrap();
+        page.slots[0].deleted = true;
+
+        let mut rec_iterator = page.data_iterator();
+        let mut record_data = rec_iterator.next();              
+        assert!(matches!(record_data, Some(data) if data == &[4, 5, 6]));
+
+        record_data = rec_iterator.next();              
+        assert!(record_data.is_none());
     }
 
 }
