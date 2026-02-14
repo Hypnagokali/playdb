@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::{table::{self, ColumnType, TableSchema}};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Cell {
     Int(i32),
     Varchar(String),

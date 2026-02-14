@@ -303,21 +303,17 @@ impl<'database> Page<'database> {
 
     fn allocate_slot(&mut self, page_offset: usize, record_length: u16) {
         self.slots.push(Slot { record_length, page_offset, deleted: false });
+    }
 
-        // let offset_index = self.slots_offset + 1; // after the delete flag index
-        // let length_index = self.slots_offset + PageDataLayout::SLOT_RECORD_LENGTH_INDEX;
-        // let length_end = length_index + 2;
+    pub fn delete_record(&mut self, record_index: usize) -> bool {
+        let slot = self.slots.get_mut(record_index);             
 
-        // // deleted flag
-        // self.data[self.slots_offset] = 0;
-        // // offset
-        // self.data[offset_index..length_index]
-        //     .copy_from_slice(&(page_offset as u32).to_be_bytes());
-        // // length
-        // self.data[length_index..length_end]
-        //     .copy_from_slice(&(0u16).to_be_bytes());
-
-        // self.slots_offset += PageDataLayout::SLOT_SIZE;
+        if let Some(slot) = slot {
+            slot.deleted = true;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn serialize(&self) -> Vec<u8> {
