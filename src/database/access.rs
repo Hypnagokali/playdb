@@ -75,6 +75,12 @@ impl<'db, S: Store> TableAccess<'db, S> {
         if !col_found {
             return Err(TableAccessError::LoadRowsError(format!("Column '{}' not found!", col_name)));
         }
+        
+        let ref_column = &self.table.schema().columns[col_index];
+        if !cell.is_of_type(&ref_column.col_type) {
+            return Err(TableAccessError::LoadRowsError(format!("Column '{}' is of type {} not {}", col_name, ref_column.col_type, cell.column_type())));
+        }
+
 
         for page in PageIterator::new(self.table, self.store, self.layout) {
             let row_iterator = PageRowIterator::new(&page, self.table.schema());
@@ -192,7 +198,76 @@ mod tests {
         let rows = access.find("name", Cell::Varchar("Hans".to_owned())).unwrap();
         assert_eq!(rows.len(), 1);
         let row = rows.get(0).unwrap();
-        assert!(matches!(row.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 1 && name == "Hans"))
+        assert!(matches!(row.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 1 && name == "Hans"));
+    }
+
+     #[test]
+    fn should_find_multiple_rows() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int),
+            Column::new(2, "name", ColumnType::Varchar(10))
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(64).unwrap();
+
+        let access = TableAccess::new(&table, &store, &layout);
+
+        let first_row = Row::new(vec![
+            Cell::Int(1),
+            Cell::Varchar("Hans".to_owned())
+        ]);
+
+        let second_row = Row::new(vec![
+            Cell::Int(2),
+            Cell::Varchar("Hans".to_owned())
+        ]);
+
+        access.insert(&first_row).unwrap();
+        access.insert(&second_row).unwrap();
+
+        let rows = access.find("name", Cell::Varchar("Hans".to_owned())).unwrap();
+        assert_eq!(rows.len(), 2);
+        let row = rows.get(0).unwrap();
+        assert!(matches!(row.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 1 && name == "Hans"));
+
+        let row = rows.get(1).unwrap();
+        assert!(matches!(row.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 2 && name == "Hans"));
+    }
+
+    #[test]
+    fn find_should_return_error_if_cell_has_wrong_type() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "id", ColumnType::Int),
+            Column::new(2, "name", ColumnType::Varchar(10))
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(64).unwrap();
+
+        let access = TableAccess::new(&table, &store, &layout);
+
+        let first_row = Row::new(vec![
+            Cell::Int(1),
+            Cell::Varchar("Hans".to_owned())
+        ]);
+
+        let second_row = Row::new(vec![
+            Cell::Int(2),
+            Cell::Varchar("Rabbit".to_owned())
+        ]);
+
+        access.insert(&first_row).unwrap();
+        access.insert(&second_row).unwrap();
+
+        let rows = access.find("name", Cell::Int(1));
+        assert!(rows.is_err());
+        let err_message = rows.err().unwrap().to_string();
+        assert!(err_message.contains("Column 'name' is of type Varchar not Int"));
     }
 
 }

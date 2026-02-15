@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{table::{self, ColumnType, TableSchema}};
+use crate::table::{self, ColumnType, TableSchema};
 
 #[derive(Debug, PartialEq)]
 pub enum Cell {
@@ -135,6 +135,33 @@ pub enum CellDeserializationError {
 }
 
 impl Cell {
+    pub fn column_type(&self) -> ColumnType {
+        match self {
+            Cell::Int(_) => ColumnType::Int,
+            Cell::Varchar(_) => ColumnType::Varchar(0),
+            Cell::Byte(_) => ColumnType::Byte,
+        }
+    }
+
+    pub fn is_of_type(&self, col_type: &ColumnType) -> bool {
+        // Needs refactoring:
+        // possible better solution: after deserialization Cell carries a reference to the actual ColumnType
+        // Cell struct with CellValue enum and the reference
+        let col_type_only = match col_type {
+            ColumnType::Int => ColumnType::Int,
+            ColumnType::Varchar(_) => ColumnType::Varchar(0),
+            ColumnType::Byte => ColumnType::Byte,
+        };
+
+        let cell_type_only = match self {
+            Cell::Int(_) => ColumnType::Int,
+            Cell::Varchar(_) => ColumnType::Varchar(0),
+            Cell::Byte(_) => ColumnType::Byte,
+        };
+
+        cell_type_only == col_type_only
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         match self {
             Cell::Int(i) => i.to_be_bytes().to_vec(),

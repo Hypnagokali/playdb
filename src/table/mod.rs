@@ -1,7 +1,9 @@
+use std::fmt::Display;
+
 pub mod table;
 // Table: play_attribute
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ColumnType { // Byte type
     Int,            // 0x01
     Varchar(u16),   // 0x02 length is stored separately
@@ -27,6 +29,16 @@ impl TableSchema {
         }
         Self {
             columns,
+        }
+    }
+}
+
+impl Display for ColumnType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColumnType::Int => f.write_str("Int"),
+            ColumnType::Varchar(_) => f.write_str("Varchar"),
+            ColumnType::Byte => f.write_str("Byte"),
         }
     }
 }
