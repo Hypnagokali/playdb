@@ -3,21 +3,21 @@ use std::fmt::Display;
 pub mod table;
 // Table: play_attribute
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum ColumnType { // Byte type
     Int,            // 0x01
     Varchar(u16),   // 0x02 length is stored separately
     Byte,           // 0x03
 }
-
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub id: i32,
     pub name: String,
     pub col_type: ColumnType,
 }
 
-#[derive(Debug)]
+// needs Clone for now, because it is shared across QueryResult and this is the quickest solution
+#[derive(Debug, Clone)]
 pub struct TableSchema {
     pub columns: Vec<Column>,
 }
@@ -39,6 +39,16 @@ impl Display for ColumnType {
             ColumnType::Int => f.write_str("Int"),
             ColumnType::Varchar(_) => f.write_str("Varchar"),
             ColumnType::Byte => f.write_str("Byte"),
+        }
+    }
+}
+
+impl ColumnType {
+    pub fn raw_type(&self) -> ColumnType {
+        match self {
+            ColumnType::Int => ColumnType::Int,
+            ColumnType::Varchar(_) => ColumnType::Varchar(0),
+            ColumnType::Byte => ColumnType::Byte,
         }
     }
 }

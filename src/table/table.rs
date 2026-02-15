@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::table::{self, ColumnType, TableSchema};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Cell {
     Int(i32),
     Varchar(String),
@@ -147,11 +147,7 @@ impl Cell {
         // Needs refactoring:
         // possible better solution: after deserialization Cell carries a reference to the actual ColumnType
         // Cell struct with CellValue enum and the reference
-        let col_type_only = match col_type {
-            ColumnType::Int => ColumnType::Int,
-            ColumnType::Varchar(_) => ColumnType::Varchar(0),
-            ColumnType::Byte => ColumnType::Byte,
-        };
+        let col_type_only = col_type.raw_type();
 
         let cell_type_only = match self {
             Cell::Int(_) => ColumnType::Int,
