@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use thiserror::Error;
 
 #[derive(Debug)]
@@ -105,36 +107,57 @@ struct Slot {
 }
 
 #[derive(Debug)]
-pub struct Record<'a> {
-    record_index: usize,
-    data: &'a [u8]
+pub struct RecordData {
+    // I need ownership because of the lazy filter chain in QueryResult
+    // Maybe a converter that directly converts a record to any type could bypass this step
+    // so essentially: RecordIterator<RecordConverter>
+    data: Rc<Vec<u8>>,
+    slice: (usize, usize),
 }
 
-impl<'a> Record<'a> {
-    pub fn data(&self) -> &'a [u8] {
-        self.data
+impl RecordData {
+    pub fn new(data: Rc<Vec<u8>>, slice_from: usize, slice_to: usize) -> Self {
+        Self {
+            data,
+            slice: (slice_from, slice_to)
+        }
+    }
+    pub fn data(&self) -> &[u8] {
+        &self.data[self.slice.0..self.slice.1]
     }
 }
 
-pub struct RecordIterator<'a> {
-    data: &'a [u8],
-    slots: &'a Vec<Slot>,
+#[derive(Debug)]
+pub struct Record {
+    record_index: usize,
+    data: RecordData,
+}
+
+impl Record {
+    pub fn data(&self) -> &[u8] {
+        self.data.data()
+    }
+}
+
+pub struct RecordIterator {
+    data: Rc<Vec<u8>>,
+    slots: Vec<Slot>,
     slot_index: usize,
 }
 
-impl<'a> RecordIterator<'a> {
+impl RecordIterator {
 
-    pub fn new(page: &'a Page) -> Self {
+    pub fn new(page: Page) -> Self {
         Self {
-            data: &page.data,
-            slots: &page.slots,
+            data: Rc::new(page.data),
+            slots: page.slots,
             slot_index: 0,
         }
     }
 }
 
-impl<'a> Iterator for RecordIterator<'a> {
-    type Item = Record<'a>;
+impl Iterator for RecordIterator {
+    type Item = Record;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut found = None;
@@ -143,9 +166,11 @@ impl<'a> Iterator for RecordIterator<'a> {
             let slot = &self.slots[self.slot_index];
 
             if !slot.deleted {
+
+                let data_to = slot.page_offset + slot.record_length as usize;
                 let record = Record {
                     record_index: self.slot_index,
-                    data: &self.data[slot.page_offset..slot.page_offset + slot.record_length as usize],
+                    data: RecordData::new(Rc::clone(&self.data), slot.page_offset, data_to),
                 };
 
                 found = Some(record);
@@ -209,7 +234,7 @@ impl<'database> Page<'database> {
         }
     }
 
-    pub fn record_iterator(&self) -> RecordIterator<'_> {
+    pub fn record_iterator(self) -> RecordIterator {
         RecordIterator::new(self)
     }
 

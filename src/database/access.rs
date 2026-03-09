@@ -1,8 +1,8 @@
-use std::{collections::HashMap, rc::Rc};
+use std::collections::HashMap;
 
 use thiserror::Error;
 
-use crate::{data::page::{PageDataLayout, PageError}, store::{PageIterator, PageRowIterator, Store}, table::{Column, TableSchema, table::{Cell, Row, RowValidationError, Table}}};
+use crate::{data::page::{PageDataLayout, PageError, Record}, store::{PageIterator, PageRowIterator, Store}, table::{Column, TableSchema, table::{Cell, Row, RowValidationError, Table}}};
 
 pub struct TableAccess<'db, S: ?Sized> {
     table: &'db Table,
@@ -18,24 +18,79 @@ pub enum TableAccessError {
     LoadRowsError(String),
 }
 
-pub struct QueryResult {
-    schema: Rc<TableSchema>,
-    rows: Vec<Row>,
+pub struct QueryResult<'db, I> {
+    row_iter: Box<dyn Iterator<Item = I> +'db>,
+    schema: TableSchema,
 }
 
-impl QueryResult {
-    fn find(self, col_name: &str, cell: Cell) -> Result<QueryResult, TableAccessError> {
-        let col_index = find_column_for_query_by_cell(&self.schema, col_name, &cell)?;
-
-        let result: Vec<Row> = self.rows.into_iter().filter(|r| {
-            r.cells()[col_index] == cell
-        }).collect();
-
-        Ok(QueryResult { schema: self.schema, rows: result })    
+impl<'db, I> QueryResult<'db, I> {
+    pub fn rows(self) -> Vec<I> {
+        self.row_iter.into_iter().map(|rec_row| rec_row).collect()
     }
-    
-    fn rows(&self) -> &Vec<Row> {
-        &self.rows
+}
+
+impl<'db> QueryResult<'db, (Record, Row)> {
+    pub fn new<S: Store>(
+        page_iter: PageIterator<'_, S>,
+        schema: TableSchema,
+    ) -> QueryResult<'_, (Record, Row)> {
+
+        let schema_iter = schema.clone();
+        let i = page_iter.flat_map(move |p| {
+            PageRowIterator::new(p, schema_iter.clone())
+        });
+
+        QueryResult {
+            row_iter: Box::new(i),
+            schema: schema.clone()
+        }
+    }
+
+    pub fn filter<F: FnMut(&(Record, Row)) -> bool + 'db>(self, f: F) -> QueryResult<'db, (Record, Row)> {
+        let iter = self.row_iter.filter(f);
+        QueryResult { 
+            row_iter: Box::new(iter),
+            schema: self.schema,
+        }
+    }
+
+    pub fn hash_join(self, inner_query: QueryResult<'db, (Record, Row)>, this_col_index: usize, that_col_index: usize) -> QueryResult<'db, Row> {
+        let mut inner_table_hashes = HashMap::new();
+        
+        let inner_schema = inner_query.schema.clone();
+        for (_, row) in inner_query.rows().into_iter() {
+            let join_key = row.cells()[that_col_index].clone();
+            inner_table_hashes.entry(join_key)
+                .or_insert_with(Vec::new)
+                .push(row);
+        }
+
+        let join_iter = self.row_iter.flat_map(move |(_, row)| {            
+            let mut result = Vec::new();
+            if let Some(join_tuples) = inner_table_hashes.get(&row.cells()[this_col_index]) {
+                for inner_row in join_tuples {
+                    let joined_cells: Vec<Cell> = row.cells().iter()
+                    .chain(inner_row.cells().iter())
+                    .cloned()
+                    .collect();
+                    result.push(Row::new(joined_cells));
+                }
+            }
+            result.into_iter()            
+        });
+
+        let joined_cols: Vec<Column> = self.schema.columns
+            .iter()
+            .chain(inner_schema.columns.iter())
+            .map(|col| (*col).clone())
+            .collect();
+
+        let joined_schema = TableSchema::new(joined_cols);
+
+        QueryResult {
+            row_iter: Box::new(join_iter),
+            schema: joined_schema,
+        }
     }
 }
 
@@ -96,43 +151,24 @@ impl<'db, S: Store> TableAccess<'db, S> {
     }
 
     /// Load all rows from all pages in the table
-    pub fn find_all(&self) -> Result<QueryResult, TableAccessError> {
-        let mut rows = Vec::new();
-
-        // Read metadata to know how many pages exist
-        for page in PageIterator::new(self.table, self.store, self.layout) {
-            let row_iterator = PageRowIterator::new(&page, self.table.schema());
-
-            for record_row in row_iterator {
-                rows.push(record_row.1);
-            }
-        }
-
-        Ok(QueryResult { schema: Rc::new(self.table.schema().clone()), rows })
+    pub fn find_all(&self) -> Result<QueryResult<'db, (Record, Row)>, TableAccessError> {
+        let page_iter = PageIterator::new(self.table, self.store, self.layout);
+        Ok(QueryResult::new(page_iter, self.table.schema().clone()))
     }
 
-    pub fn find(&self, col_name: &str, cell: Cell) -> Result<QueryResult, TableAccessError> {
+    pub fn find(&self, col_name: &str, cell: Cell) -> Result<QueryResult<'db, (Record, Row)>, TableAccessError> {
         // Full table scan:
-        let mut result = Vec::new();
         let col_index = find_column_for_query_by_cell(self.table.schema(), col_name, &cell)?;
 
-
-        for page in PageIterator::new(self.table, self.store, self.layout) {
-            let row_iterator = PageRowIterator::new(&page, self.table.schema());
-
-            for record_row in row_iterator {
-                let row = record_row.1;
-                if row.cells()[col_index] == cell {
-                    result.push(row);
-                }
-            }
-        }
-
-        Ok(QueryResult { schema: Rc::new(self.table.schema().clone()), rows: result })
+        let page_iter = PageIterator::new(self.table, self.store, self.layout);
+        let qr = QueryResult::new(page_iter, self.table.schema().clone());
+        Ok(qr.filter(move |(_, row)| {
+            row.cells()[col_index] == cell
+        }))
     }
 
     // Performs a inner join with Hash Join
-    pub fn join(&self, join_table_access: &TableAccess<'_, S>, this_join_column: &str, that_join_column: &str) -> Result<QueryResult, TableAccessError> {
+    pub fn join(&self, join_table_access: &TableAccess<'db, S>, this_join_column: &str, that_join_column: &str) -> Result<QueryResult<'db, Row>, TableAccessError> {
         let that_col_index = find_column_for_query(join_table_access.table.schema(), that_join_column)?;
         let this_col_index = find_column_for_query(self.table.schema(), this_join_column)?;
 
@@ -144,39 +180,12 @@ impl<'db, S: Store> TableAccess<'db, S> {
             return Err(TableAccessError::LoadRowsError(format!("Join columns have different types: {} vs {}", this_col_type, that_col_type)));
         }
 
-        // 2. create hashmap with this type as key        
-        let mut inner_table_hashes = HashMap::new();
-        let inner_result= join_table_access.find_all()?;
-        for r in inner_result.rows().iter() {
-            let join_key = &r.cells()[that_col_index];
-            inner_table_hashes.entry(join_key)
-                .or_insert_with(Vec::new)
-                .push(r);
-        }
-
-        // 3. build join QueryResult
         let outer_result = self.find_all()?;
-        let mut result = Vec::new();
-        for r in outer_result.rows().iter() {
-            if let Some(join_tuples) = inner_table_hashes.get(&r.cells()[this_col_index]) {
-                for &inner_row in join_tuples {
-                    let joined_cells: Vec<Cell> = r.cells().iter()
-                    .chain(inner_row.cells().iter())
-                    .map(|c| (*c).clone())
-                    .collect();
-                    result.push(Row::new(joined_cells));
-                }
-            }
-        }
-        let joined_cols: Vec<Column> = self.table.schema().columns
-            .iter()
-            .chain(join_table_access.table.schema().columns.iter())
-            .map(|col| (*col).clone())
-            .collect();
+        let inner_query = join_table_access.find_all()?;
 
-        let joined_schema = TableSchema::new(joined_cols);
+        let join_result = outer_result.hash_join(inner_query, this_col_index, that_col_index);
 
-        Ok(QueryResult { schema: Rc::new(joined_schema), rows: result })  
+        Ok(join_result)  
     }
 
     // Currently maximally naive insert implementation
@@ -283,7 +292,7 @@ mod tests {
         let rows = result.rows();
         assert_eq!(rows.len(), 1);
         let row = rows.get(0).unwrap();
-        assert!(matches!(row.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 1 && name == "Hans"));
+        assert!(matches!(row.1.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 1 && name == "Hans"));
     }
 
      #[test]
@@ -317,10 +326,10 @@ mod tests {
         let rows = result.rows();
         assert_eq!(rows.len(), 2);
         let row = rows.get(0).unwrap();
-        assert!(matches!(row.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 1 && name == "Hans"));
+        assert!(matches!(row.1.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 1 && name == "Hans"));
 
         let row = rows.get(1).unwrap();
-        assert!(matches!(row.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 2 && name == "Hans"));
+        assert!(matches!(row.1.cells().as_slice(), [Cell::Int(id), Cell::Varchar(name)] if *id == 2 && name == "Hans"));
     }
 
     #[test]
@@ -411,13 +420,14 @@ mod tests {
         assert_eq!(result.schema.columns[2], Column::new(1, "person_id", ColumnType::Int));
         assert_eq!(result.schema.columns[3], Column::new(2, "address", ColumnType::Varchar(64)));
 
-        assert_eq!(result.rows().len(), 2);
-        let cells_hans = result.rows()[0].cells();
+        let rows = result.rows();
+        assert_eq!(rows.len(), 2);
+        let cells_hans = rows[0].cells();
         assert_eq!(
             *cells_hans, 
             vec![Cell::Int(1), Cell::Varchar("Hans".to_owned()), Cell::Int(1), Cell::Varchar("Lilienstr 99".to_owned())]);
 
-        let cells_rabbit = result.rows()[1].cells();
+        let cells_rabbit = rows[1].cells();
         assert_eq!(
             *cells_rabbit, 
             vec![Cell::Int(2), Cell::Varchar("Rabbit".to_owned()), Cell::Int(2), Cell::Varchar("Bergmansweg 10".to_owned())]);

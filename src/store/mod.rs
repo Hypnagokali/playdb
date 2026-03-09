@@ -57,13 +57,13 @@ impl<'db, S: Store> Iterator for PageIterator<'db, S> {
     }
 }
 
-pub struct PageRowIterator<'a> {
-    record_iterator: RecordIterator<'a>,
-    schema: &'a TableSchema,
+pub struct PageRowIterator {
+    record_iterator: RecordIterator,
+    schema: TableSchema,
 }
 
-impl<'a> PageRowIterator<'a> {
-    pub fn new(page: &'a Page, schema: &'a TableSchema) -> Self {
+impl PageRowIterator {
+    pub fn new(page: Page, schema: TableSchema) -> Self {
         Self { 
             record_iterator: page.record_iterator(),
             schema 
@@ -71,13 +71,14 @@ impl<'a> PageRowIterator<'a> {
     }
 }
 
-impl<'db> Iterator for PageRowIterator<'db> {
-    type Item = (Record<'db>, Row);
+impl Iterator for PageRowIterator {
+    // Record is needed for accessing a slot directly (e.g., when we want to delete a row)
+    type Item = (Record, Row);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.record_iterator.next()
             .map(|r| {
-                let row = Row::deserialize(r.data(), self.schema);
+                let row = Row::deserialize(r.data(), &self.schema);
 
                 (r, row)
             })
