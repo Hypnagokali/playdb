@@ -54,7 +54,23 @@ impl<'db> QueryResult<'db, (Record, Row)> {
         }
     }
 
-    pub fn hash_join(self, inner_query: QueryResult<'db, (Record, Row)>, this_col_index: usize, that_col_index: usize) -> QueryResult<'db, Row> {
+    pub fn hash_join(
+        self,
+        inner_query: QueryResult<'db, (Record, Row)>,
+        this_join_column: &str, 
+        that_join_column: &str
+    ) -> Result<QueryResult<'db, Row>, TableAccessError> {
+        let that_col_index = find_column_for_query(&inner_query.schema, that_join_column)?;
+        let this_col_index = find_column_for_query(&self.schema, this_join_column)?;
+
+        // 1. check if type is equal
+        let this_col_type = self.schema.columns[this_col_index].col_type.raw_type();
+        let that_col_type = inner_query.schema.columns[that_col_index].col_type.raw_type();
+
+        if this_col_type != that_col_type {
+            return Err(TableAccessError::LoadRowsError(format!("Join columns have different types: {} vs {}", this_col_type, that_col_type)));
+        }
+        
         let mut inner_table_hashes = HashMap::new();
         
         let inner_schema = inner_query.schema.clone();
@@ -87,10 +103,10 @@ impl<'db> QueryResult<'db, (Record, Row)> {
 
         let joined_schema = TableSchema::new(joined_cols);
 
-        QueryResult {
+        Ok(QueryResult {
             row_iter: Box::new(join_iter),
             schema: joined_schema,
-        }
+        })
     }
 }
 
@@ -165,27 +181,6 @@ impl<'db, S: Store> TableAccess<'db, S> {
         Ok(qr.filter(move |(_, row)| {
             row.cells()[col_index] == cell
         }))
-    }
-
-    // Performs a inner join with Hash Join
-    pub fn join(&self, join_table_access: &TableAccess<'db, S>, this_join_column: &str, that_join_column: &str) -> Result<QueryResult<'db, Row>, TableAccessError> {
-        let that_col_index = find_column_for_query(join_table_access.table.schema(), that_join_column)?;
-        let this_col_index = find_column_for_query(self.table.schema(), this_join_column)?;
-
-        // 1. check if type is equal
-        let this_col_type = self.table.schema().columns[this_col_index].col_type.raw_type();
-        let that_col_type = join_table_access.table.schema().columns[that_col_index].col_type.raw_type();
-
-        if this_col_type != that_col_type {
-            return Err(TableAccessError::LoadRowsError(format!("Join columns have different types: {} vs {}", this_col_type, that_col_type)));
-        }
-
-        let outer_result = self.find_all()?;
-        let inner_query = join_table_access.find_all()?;
-
-        let join_result = outer_result.hash_join(inner_query, this_col_index, that_col_index);
-
-        Ok(join_result)  
     }
 
     // Currently maximally naive insert implementation
@@ -413,7 +408,13 @@ mod tests {
         address_access.insert(&first_address).unwrap();
         address_access.insert(&second_address).unwrap();
 
-        let result = person_access.join(&address_access, "id", "person_id").unwrap();
+        // ACT:
+        // SELECT * FROM person 
+        // JOIN address ON person.id = address.person_id
+        let person_result = person_access.find_all().unwrap();
+        let address_result = address_access.find_all().unwrap();
+
+        let result = person_result.hash_join(address_result, "id", "person_id").unwrap();
         assert_eq!(result.schema.columns.len(), 4);
         assert_eq!(result.schema.columns[0], Column::new(1, "id", ColumnType::Int));
         assert_eq!(result.schema.columns[1], Column::new(2, "name", ColumnType::Varchar(10)));
