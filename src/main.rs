@@ -1,5 +1,6 @@
 mod schema;
 mod data;
+#[allow(unused)]
 mod tree;
 
 fn main() {

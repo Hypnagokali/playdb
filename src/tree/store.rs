@@ -24,13 +24,16 @@ const POS_NEXT_DELETED_PAGE: usize = 5;
 // 9 x 4 bytes: keys
 // 10 x 4 bytes: pageIds
 // 9 x 4 bytes: values
+const NEXT_LEAF_SIZE: usize = 4;
+// 4 bytes: next_leaf (linked list) u32:MAX for NULL
 
 // just for playing around, should be encoded in meta data header.
+const PAGE_DATA_START: usize = 9; // same as PAGE_HEADER_SIZE
 const PAGE_HEADER_SIZE: usize = 9;
 const META_DATA_HEADER_SIZE: usize = 14;
 
 fn key_offset() -> usize {
-    PAGE_HEADER_SIZE
+    PAGE_DATA_START
 }
 
 fn key_array_size(max_degree: u16) -> usize {
@@ -47,6 +50,11 @@ fn children_array_size(max_degree: u16) -> usize {
 
 fn values_offset(max_degree: u16) -> usize {
     children_offset(max_degree) + children_array_size(max_degree)
+}
+
+fn next_leaf_offset(max_degree: u16) -> usize {
+    // size of children == size of keys
+    values_offset(max_degree) + key_array_size(max_degree)
 }
 
 fn meta_data_to_bytes(store_meta_data: &StoreMetaData) -> Vec<u8> {
@@ -82,35 +90,33 @@ impl StoreMetaData {
         self.root = Some(root_page_id);
         self.changed = true;
     }
-
-    
 }
 
 impl From<(Vec<u8>, u16)> for NodePage {
-    fn from(value_degree_tupel: (Vec<u8>, u16)) -> Self {
-        let value = value_degree_tupel.0;
-        let max_degree = value_degree_tupel.1;
+    fn from(page_bytes_and_degree: (Vec<u8>, u16)) -> Self {
+        let page_bytes = page_bytes_and_degree.0;
+        let max_degree = page_bytes_and_degree.1;
 
-        let page_id = u32::from_be_bytes(value[POS_PAGE_ID..POS_PAGE_ID + 4].try_into().unwrap());
+        let page_id = u32::from_be_bytes(page_bytes[POS_PAGE_ID..POS_PAGE_ID + 4].try_into().unwrap());
 
         if page_id == u32::MAX {
             panic!("Read a page with INVALID id.");
         }
 
-        let deleted = match value[POS_DELETED] {
+        let deleted = match page_bytes[POS_DELETED] {
             0 => false,
             _ => true,
         };
 
         let next_deleted_page = read_u32_with_null(
-            u32::from_be_bytes(value[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].try_into().unwrap())
+            u32::from_be_bytes(page_bytes[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].try_into().unwrap())
         );
 
         let mut keys = Vec::new();
         let key_offset = key_offset();
         for k in 0..(max_degree - 1) {
             let next_offset = key_offset + (k as usize * 4);
-            let next_key = read_u32_with_null(u32::from_be_bytes(value[next_offset..(next_offset + 4)].try_into().unwrap()));
+            let next_key = read_u32_with_null(u32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
             if let Some(next_key) = next_key {
                 keys.push(next_key);
             } else {
@@ -123,7 +129,7 @@ impl From<(Vec<u8>, u16)> for NodePage {
         let child_offset = children_offset(max_degree);
         for c in 0..max_degree {
             let next_offset = child_offset + (c as usize * 4);
-            let next_child = read_u32_with_null(u32::from_be_bytes(value[next_offset..(next_offset + 4)].try_into().unwrap()));
+            let next_child = read_u32_with_null(u32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
             if let Some(next_child) = next_child {
                 children.push(next_child);
             } else {
@@ -136,7 +142,7 @@ impl From<(Vec<u8>, u16)> for NodePage {
         let value_offset = values_offset(max_degree);
         for v in 0..(max_degree - 1) {
             let next_offset = value_offset + (v as usize * 4);
-            let next_value = read_u32_with_null(u32::from_be_bytes(value[next_offset..(next_offset + 4)].try_into().unwrap()));
+            let next_value = read_u32_with_null(u32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
             if let Some(next_value) = next_value {
                 values.push(next_value);
             } else {
@@ -144,7 +150,23 @@ impl From<(Vec<u8>, u16)> for NodePage {
             }
         }
 
-        NodePage::new_from_store(page_id, deleted, next_deleted_page, keys, children, values, max_degree as usize)
+        let next_leaf_offset = next_leaf_offset(max_degree);
+        let next_leaf = read_u32_with_null(
+            u32::from_be_bytes(page_bytes[next_leaf_offset..next_leaf_offset + 4]
+                .try_into()
+                .unwrap()
+            )
+        );
+
+        NodePage::new_from_store(
+            page_id,
+            deleted,
+            next_deleted_page,
+            keys,
+            children,
+            values,
+            next_leaf,
+            max_degree as usize)
     }
 }
 
@@ -174,14 +196,13 @@ impl NodePager {
         let keys = ((meta_data.max_degree - 1) * 4) as u32;
         let values = ((meta_data.max_degree - 1) * 4) as u32;
 
-        children + keys + values + PAGE_HEADER_SIZE as u32
+        children + keys + values + NEXT_LEAF_SIZE as u32 + PAGE_HEADER_SIZE as u32
     }
 
     pub fn write_page(&self, node: &NodePage) -> Result<(), NodePagerError> {
         if !*node.changed().borrow() {
             return Ok(());
         }
-        // TODO: flag "changed" needed for node, so that the content will only be written, if the content has changed.
         if *node.id() == u32::MAX {
             return Err(NodePagerError { msg: "Cannot save page with the id 0xFFFFFFFF".to_owned() });
         }
@@ -219,6 +240,12 @@ impl NodePager {
             let current_offset = values_offset + (i * 4);
             data[current_offset..(current_offset + 4)].copy_from_slice(&v.to_be_bytes());
         }
+
+        let next_leaf_offset = next_leaf_offset(meta_data.max_degree);
+
+        data[next_leaf_offset..(next_leaf_offset + 4)].copy_from_slice(
+            &get_u32_be_bytes_from_option(node.next_leaf())
+        );
 
         let offset = META_DATA_HEADER_SIZE as u32 + (self.page_size() * node.id());
         file.seek(std::io::SeekFrom::Start(offset as u64))
@@ -375,33 +402,123 @@ impl BTreeStore {
         self.pager.page_size()
     }
 
+    pub fn print_nodes(&self) {
+        match self.root() {
+            Ok(r) => r.print_all_nodes(&self.pager),
+            _ => (),
+        }
+    }
+
+    pub fn next_node(&self, node: &NodePage) -> Result<Option<NodePage>, BTreeStoreError> {
+        if let Some(page_id) = node.next_leaf() {
+            Ok(Some(self.pager.read_page(*page_id)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn find_smaller_than(&self, key: u32, with_equal: bool) -> Result<Vec<u32>, BTreeStoreError> {
+        let mut result = Vec::new();
+        let mut node = self.find_left_most_node()?;
+        let target_node = self.find_node(key)?;
+
+        if let Some(target_node) = target_node {
+            while let Some(next) = node {
+
+                if *target_node.id() == *next.id() {
+                    for i in 0..next.keys().len() {
+                        if next.keys()[i] < key || (with_equal && next.keys()[i] == key) {
+                            result.push(next.values()[i]);
+                        }
+                    }
+                    break;
+                } else {
+                    result.extend(next.values());
+                }
+
+                node = self.next_node(&next)?
+            }
+        }
+        
+        Ok(result)
+    }
+
+    pub fn find_greater_than(&self, key: u32, with_equal: bool) -> Result<Vec<u32>, BTreeStoreError> {
+        let mut result = Vec::new();
+        let mut node = self.find_node(key)?;
+        
+        let mut start_node = true;
+        while let Some(next) = node {
+            if start_node {
+                // The first node might contain multiple keys that are smaller than the key being searched for
+                for i in 0..next.keys().len() {
+                    if next.keys()[i] > key || (with_equal && next.keys()[i] == key) {
+                        result.push(next.values()[i]);
+                    }
+                }
+                start_node = false;
+            } else {
+                result.extend_from_slice(next.values());
+            }
+            
+            node = self.next_node(&next)?
+        }
+
+        Ok(result)
+    }
+
+    pub fn find_left_most_node(&self) -> Result<Option<NodePage>, BTreeStoreError> {
+        let root = self.root()?;
+
+        if let Some(page_id) = root.find_left_most_node(&self.pager) {
+            Ok(Some(self.pager.read_page(page_id)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn find_node(&self, key: u32) -> Result<Option<NodePage>, BTreeStoreError> {
+        let root = self.root()?;
+
+        if let Some(page_id) = root.find_node(&self.pager, key) {
+            Ok(Some(self.pager.read_page(page_id)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn find(&self, key: u32) -> Result<Option<u32>, BTreeStoreError> {
         let root = self.root()?;
 
-        Ok(root.find(&self.pager, key))
+        Ok(root.find_value(&self.pager, key))
     }
 
     pub fn insert(&mut self, key: u32, value: u32) -> Result<(), BTreeStoreError> {
         let mut root = self.root()?;
         if root.is_full() {
-            let (lnode, rnode, root_key) = root.split(&self.pager);
+            let (rnode, root_key) = root.split(&self.pager);
             let mut new_root = self.pager.allocate_new_page()
                 .map_err(|_| BTreeStoreError { msg: "Cannot allocate new page (op: insert)".to_owned() })?;
             new_root.keys_mut().push(root_key);
-            new_root.children_mut().push(*lnode.id());
+            // root becomes the left node
+            new_root.children_mut().push(*root.id());
             new_root.children_mut().push(*rnode.id());
-
+            
             self.meta_data.borrow_mut().root = Some(*new_root.id());
-            // TODO: new root
+        
+            // for the insert: set variable root to new_root
             root = new_root;
             *root.changed().borrow_mut() = true;
         }
+
+        
         
         root.insert(&self.pager, key, value);
         self.pager.write_page(&root)
                 .map_err(|_| BTreeStoreError { msg: "Cannot write new root (op: insert)".to_owned() })?;
 
         self.save_metadata()?;
+
         Ok(())
     }
 
@@ -460,6 +577,74 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use crate::tree::{store::BTreeStore, node::NodePage};
+
+    #[test]
+    fn find_left_most_node() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+        btree.insert(2, 2).unwrap();
+        btree.insert(5, 5).unwrap();      
+        btree.insert(100, 100).unwrap();
+        btree.insert(3, 3).unwrap();
+        btree.insert(4, 4).unwrap();
+        btree.insert(50, 50).unwrap();
+        btree.insert(20, 20).unwrap();
+
+        let mut node = btree.find_left_most_node().unwrap().unwrap();
+        assert_eq!(node.keys(), &vec![1u32]);
+    }
+
+    #[test]
+    fn find_all_smaller_than() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+        btree.insert(2, 2).unwrap();
+        btree.insert(5, 5).unwrap();      
+        btree.insert(100, 100).unwrap();
+        btree.insert(3, 3).unwrap();
+        btree.insert(4, 4).unwrap();
+        btree.insert(50, 50).unwrap();
+        btree.insert(20, 20).unwrap();
+        btree.insert(6, 6).unwrap();
+        btree.insert(7, 7).unwrap();
+        btree.insert(8, 8).unwrap();
+
+        let mut result = btree.find_smaller_than(20, true).unwrap();
+        assert_eq!(result, vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 20]);
+
+        let mut result = btree.find_smaller_than(20, false).unwrap();
+        assert_eq!(result, vec![1, 2, 3, 4, 5, 6, 7, 8, 10]);
+    }
+
+
+
+    #[test]
+    fn find_all_greater_than() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+        btree.insert(2, 2).unwrap();
+        btree.insert(5, 5).unwrap();      
+        btree.insert(100, 100).unwrap();
+        btree.insert(3, 3).unwrap();
+        btree.insert(4, 4).unwrap();
+        btree.insert(50, 50).unwrap();
+        btree.insert(20, 20).unwrap();
+        btree.insert(6, 6).unwrap();
+        btree.insert(7, 7).unwrap();
+        btree.insert(8, 8).unwrap();
+
+        let mut result = btree.find_greater_than(7, true).unwrap();
+        assert_eq!(result, vec![7, 8, 10, 20, 50, 100]);
+
+        let mut result = btree.find_greater_than(7, false).unwrap();
+        assert_eq!(result, vec![8, 10, 20, 50, 100]);
+    }
 
     #[test]
     fn delete_everything_except_one_key() {
@@ -618,7 +803,7 @@ mod tests {
             0, false, 
             None, vec![1, 5, 6],
             vec![3, 9, 10, 16], Vec::new(),
-            4
+            None, 4
         );
 
         *page1.changed().borrow_mut() = true;
@@ -641,7 +826,7 @@ mod tests {
             1, false, 
             None, vec![7, 8],
             Vec::new(), vec![1, 2],
-            4
+            None, 4
         );
         *page2.changed().borrow_mut() = true;
         btree.pager.write_page(&page2).unwrap();
@@ -663,7 +848,7 @@ mod tests {
         assert!(btree.is_err());
         let btree = BTreeStore::new(temp.path(), 4);
         assert!(btree.is_ok());
-        assert_eq!(btree.unwrap().page_size(), 49) // 9 + 4*4 + 3*4 + 3*4 = 45
+        assert_eq!(btree.unwrap().page_size(), 53) // 9 + 4*4 + 3*4 + 3*4 + 4 = 53
     }
 
     #[test]
@@ -681,7 +866,7 @@ mod tests {
         assert_eq!(meta_data.first_deleted_page, None);
         assert_eq!(meta_data.max_degree, 10); // Use the degree from meta data section
         assert_eq!(meta_data.number_of_pages, 0);
-        assert_eq!(btree.page_size(), 121) // 9 + 10*4 + 9*4 + 9*4 = 121
+        assert_eq!(btree.page_size(), 125) // 9 + 10*4 + 9*4 + 9*4 + 4 = 125
     }
 
 }

@@ -53,7 +53,7 @@ impl Page {
         if metadata.len() == 0 {
             None
         } else {
-            let last_page_number = (metadata.len() / PAGE_SIZE as u64 - 1);
+            let last_page_number = metadata.len() / PAGE_SIZE as u64 - 1;
             Self::from_file(file, last_page_number as usize).ok()
         }
     }
