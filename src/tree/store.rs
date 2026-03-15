@@ -1,0 +1,895 @@
+use std::{cell::RefCell, fs::{self, File, OpenOptions}, io::{Read, Seek, Write}, path::Path, rc::Rc, time::Duration, u32};
+
+use thiserror::Error;
+use ttl_cache::TtlCache;
+
+use crate::tree::node::NodeOperationError;
+
+use super::{get_u32_be_bytes_from_option, node::NodePage, read_u32_with_null};
+
+// File design:
+
+// Metadata header => 14 Bytes
+// 2 bytes: max_degree
+// 4 bytes: number_of_pages (max: u32:MAX - 1)
+// 4 bytes: first_deleted_page (u32::MAX for INVALID / NULL)
+// 4 bytes: root (u32::MAX for INVALID / NULL)
+// -----------------------------------
+// Page
+// Meta-Section:
+// 4 Bytes: page_id
+const POS_PAGE_ID: usize = 0;
+// 1 Byte: Deleted (0x00: not deleted, everything else: deleted)
+const POS_DELETED: usize = 4;
+// 4 bytes: next_deleted_page (number of next deleted page, u32::MAX for INVALID / NULL)
+const POS_NEXT_DELETED_PAGE: usize = 5;
+// Node-Section:
+// 9 x 4 bytes: keys
+// 10 x 4 bytes: pageIds
+// 9 x 4 bytes: values
+const NEXT_LEAF_SIZE: usize = 4;
+// 4 bytes: next_leaf (linked list) u32:MAX for NULL
+
+// just for playing around, should be encoded in meta data header.
+const PAGE_DATA_START: usize = 9; // same as PAGE_HEADER_SIZE
+const PAGE_HEADER_SIZE: usize = 9;
+const META_DATA_HEADER_SIZE: usize = 14;
+
+fn key_offset() -> usize {
+    PAGE_DATA_START
+}
+
+fn key_array_size(max_degree: u16) -> usize {
+    ((max_degree - 1) * 4) as usize
+}
+
+fn children_offset(max_degree: u16) -> usize {
+    key_offset() + key_array_size(max_degree)
+}
+
+fn children_array_size(max_degree: u16) -> usize {
+    max_degree as usize * 4
+}
+
+fn values_offset(max_degree: u16) -> usize {
+    children_offset(max_degree) + children_array_size(max_degree)
+}
+
+fn next_leaf_offset(max_degree: u16) -> usize {
+    // size of children == size of keys
+    values_offset(max_degree) + key_array_size(max_degree)
+}
+
+fn meta_data_to_bytes(store_meta_data: &StoreMetaData) -> Vec<u8> {
+    let mut metadata_bytes = [0u8; META_DATA_HEADER_SIZE];
+    metadata_bytes[0..2].copy_from_slice(&store_meta_data.max_degree.to_be_bytes());
+    metadata_bytes[2..6].copy_from_slice(&store_meta_data.number_of_pages.to_be_bytes());
+    metadata_bytes[6..10].copy_from_slice(&get_u32_be_bytes_from_option(&store_meta_data.first_deleted_page));
+    metadata_bytes[10..14].copy_from_slice(&get_u32_be_bytes_from_option(&store_meta_data.root));
+    metadata_bytes.to_vec()
+}
+
+#[derive(Debug)]
+pub struct StoreMetaData {
+    max_degree: u16,
+    number_of_pages: u32, // in total: with deleted pages
+    first_deleted_page: Option<u32>,
+    root: Option<u32>,
+    changed: bool, // will not be serialized, is only a flag, if NodePager has changed the meta data
+    unique_index: bool, // not serialized yet, because I only deal with unique indexes at the moment (so it's always true)
+}
+
+impl StoreMetaData {
+    pub fn inc_number_of_pages(&mut self) {
+        self.number_of_pages += 1;
+        self.changed = true;
+    }
+
+    pub fn set_first_deleted_page(&mut self, page: Option<u32>) {
+        self.first_deleted_page = page;
+        self.changed = true;
+    }
+
+    pub fn set_root(&mut self, root_page_id: u32) {
+        self.root = Some(root_page_id);
+        self.changed = true;
+    }
+}
+
+impl From<(Vec<u8>, u16)> for NodePage {
+    fn from(page_bytes_and_degree: (Vec<u8>, u16)) -> Self {
+        let page_bytes = page_bytes_and_degree.0;
+        let max_degree = page_bytes_and_degree.1;
+
+        let page_id = u32::from_be_bytes(page_bytes[POS_PAGE_ID..POS_PAGE_ID + 4].try_into().unwrap());
+
+        if page_id == u32::MAX {
+            panic!("Read a page with INVALID id.");
+        }
+
+        let deleted = match page_bytes[POS_DELETED] {
+            0 => false,
+            _ => true,
+        };
+
+        let next_deleted_page = read_u32_with_null(
+            u32::from_be_bytes(page_bytes[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].try_into().unwrap())
+        );
+
+        let mut keys = Vec::new();
+        let key_offset = key_offset();
+        for k in 0..(max_degree - 1) {
+            let next_offset = key_offset + (k as usize * 4);
+            let next_key = read_u32_with_null(u32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
+            if let Some(next_key) = next_key {
+                keys.push(next_key);
+            } else {
+                break;
+            }
+        }
+        
+        let mut children = Vec::new();
+        
+        let child_offset = children_offset(max_degree);
+        for c in 0..max_degree {
+            let next_offset = child_offset + (c as usize * 4);
+            let next_child = read_u32_with_null(u32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
+            if let Some(next_child) = next_child {
+                children.push(next_child);
+            } else {
+                break;
+            }
+        }
+        
+        let mut values = Vec::new();
+        
+        let value_offset = values_offset(max_degree);
+        for v in 0..(max_degree - 1) {
+            let next_offset = value_offset + (v as usize * 4);
+            let next_value = read_u32_with_null(u32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
+            if let Some(next_value) = next_value {
+                values.push(next_value);
+            } else {
+                break;
+            }
+        }
+
+        let next_leaf_offset = next_leaf_offset(max_degree);
+        let next_leaf = read_u32_with_null(
+            u32::from_be_bytes(page_bytes[next_leaf_offset..next_leaf_offset + 4]
+                .try_into()
+                .unwrap()
+            )
+        );
+
+        NodePage::new_from_store(
+            page_id,
+            deleted,
+            next_deleted_page,
+            keys,
+            children,
+            values,
+            next_leaf,
+            max_degree as usize)
+    }
+}
+
+pub struct NodePager {
+    file: RefCell<File>,
+    cache: RefCell<TtlCache<u32, NodePage>>,
+    meta_data: Rc<RefCell<StoreMetaData>>,
+}
+
+#[derive(Debug, Error)]
+#[error("NodePager error: {msg}")]
+pub struct NodePagerError {
+    msg: String
+}
+
+
+impl NodePager {
+    fn new(file: File, meta_data: Rc<RefCell<StoreMetaData>>) -> Self {
+        let cache = TtlCache::new(500);
+        NodePager { 
+            file: RefCell::new(file),
+            cache: RefCell::new(cache),
+            meta_data,
+        }
+    }
+
+    pub fn page_size(&self) -> u32 {
+        let meta_data = self.meta_data.borrow();
+        let children = (meta_data.max_degree * 4) as u32;
+        let keys = ((meta_data.max_degree - 1) * 4) as u32;
+        let values = ((meta_data.max_degree - 1) * 4) as u32;
+
+        children + keys + values + NEXT_LEAF_SIZE as u32 + PAGE_HEADER_SIZE as u32
+    }
+
+    pub fn write_page(&self, node: &NodePage) -> Result<(), NodePagerError> {
+        if !*node.changed().borrow() {
+            return Ok(());
+        }
+        if *node.id() == u32::MAX {
+            return Err(NodePagerError { msg: "Cannot save page with the id 0xFFFFFFFF".to_owned() });
+        }
+        if *node.deleted() {
+            return Err(NodePagerError { msg: "Cannot write deleted pages. Use delete for this operation".to_owned() });
+        }
+        
+        let meta_data = self.meta_data.borrow();
+        let mut file= self.file.borrow_mut();
+        let mut data = vec![0xFF; self.page_size() as usize];
+        
+        // build page header
+        data[POS_PAGE_ID..POS_PAGE_ID + 4].copy_from_slice(&node.id().to_be_bytes());
+        data[POS_DELETED] = match node.deleted() {
+            true => 1,
+            false => 0,
+        };
+        data[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].copy_from_slice(&get_u32_be_bytes_from_option(node.next_deleted_page()));
+
+        // build Node
+        let key_offset = key_offset();
+        for (i, k) in node.keys().iter().enumerate() {
+            let current_offset = key_offset + (i * 4);
+            data[current_offset..(current_offset + 4)].copy_from_slice(&k.to_be_bytes());
+        }
+
+        let child_offset = children_offset(meta_data.max_degree);
+        for (i, c) in node.children().iter().enumerate() {
+            let current_offset = child_offset + (i * 4);
+            data[current_offset..(current_offset + 4)].copy_from_slice(&c.to_be_bytes());
+        }
+
+        let values_offset = values_offset(meta_data.max_degree);
+        for (i, v) in node.values().iter().enumerate() {
+            let current_offset = values_offset + (i * 4);
+            data[current_offset..(current_offset + 4)].copy_from_slice(&v.to_be_bytes());
+        }
+
+        let next_leaf_offset = next_leaf_offset(meta_data.max_degree);
+
+        data[next_leaf_offset..(next_leaf_offset + 4)].copy_from_slice(
+            &get_u32_be_bytes_from_option(node.next_leaf())
+        );
+
+        let offset = META_DATA_HEADER_SIZE as u32 + (self.page_size() * node.id());
+        file.seek(std::io::SeekFrom::Start(offset as u64))
+            .map_err(|_| NodePagerError { msg: "Cannot go to offset (read_page error)".to_owned() })?;
+        file.write(&data)
+            .map_err(|e| NodePagerError { msg: format!("Cannot write NodePage: {}", e)})?;
+
+        *node.changed().borrow_mut() = false;
+
+        self.cache.borrow_mut().insert(*node.id(), node.clone(), Duration::from_secs(120));
+
+        Ok(())
+    }
+
+    pub fn read_page(&self, page_id: u32) -> Result<NodePage, NodePagerError> {
+        if let Some(node) = self.cache.borrow().get(&page_id) {
+            return Ok(node.clone());
+        }
+
+        let mut file= self.file.borrow_mut();
+        let mut data = vec![0; self.page_size() as usize];
+        let offset = META_DATA_HEADER_SIZE as u32 + (self.page_size() * page_id);
+        file.seek(std::io::SeekFrom::Start(offset as u64))
+            .map_err(|_| NodePagerError { msg: "Cannot go to offset (read_page error)".to_owned() })?;
+
+        file.read_exact(&mut data)
+            .map_err(|e| NodePagerError { msg: format!("Cannot read data (read_page). {}", e)})?;
+
+        Ok((data, self.meta_data.borrow().max_degree).into())
+    }
+
+    pub fn delete_page(&self, page_id: u32) -> Result<(), NodePagerError> {
+        if page_id == u32::MAX {
+            return Err(NodePagerError { msg: "Cannot delete page_id 0xFFFFFFFF".to_owned() });
+        }
+
+        let first_deleted_page = self.meta_data.borrow().first_deleted_page;
+        let mut node = self.read_page(page_id)?;
+        node.delete_page(first_deleted_page);
+        self.meta_data.borrow_mut().set_first_deleted_page(Some(*node.id()));
+
+        Ok(())
+    }
+
+    pub fn allocate_new_page(&self) -> Result<NodePage, NodePagerError> {
+        // Is there a deleted page?
+        let first_deleted = self.meta_data.borrow().first_deleted_page;
+        if let Some(first_deleted) = first_deleted {
+            match self.read_page(first_deleted) {
+                Ok(mut allocated) => {
+                    self.meta_data.borrow_mut().set_first_deleted_page(*allocated.next_deleted_page());
+                    allocated.reallocate();
+                    self.write_page(&allocated)?;
+                    return Ok(allocated);
+                },
+                Err(e) => 
+                    return Err(
+                        NodePagerError { msg: format!("Failed to reallocate page with ID = {}, err = {}", first_deleted, e)}
+                    ),
+            };
+        } else {
+            self.meta_data.borrow_mut().inc_number_of_pages();
+            let next_id = self.meta_data.borrow().number_of_pages - 1;
+            let node = NodePage::new(self.meta_data.borrow().max_degree as usize, next_id);
+            self.write_page(&node)?;
+            // is likely to change after allocation
+            *node.changed().borrow_mut() = true;
+            Ok(node)
+        }
+
+    }
+}
+
+pub struct BTreeStore {
+    pager: NodePager,
+    meta_data: Rc<RefCell<StoreMetaData>>,
+}
+
+#[derive(Debug, Error)]
+#[error("B+ Tree error: {msg}")]
+pub struct BTreeStoreError {
+    msg: String
+}
+
+impl From<NodePagerError> for BTreeStoreError {
+    fn from(value: NodePagerError) -> Self {
+        Self {
+            msg: format!("BTreeStoreError occurred. err={}", value),
+        }
+    }
+}
+
+impl From<NodeOperationError> for BTreeStoreError {
+    fn from(value: NodeOperationError) -> Self {
+        Self {
+            msg: format!("BTreeStoreError occurred. err={}", value),
+        }
+    }
+}
+
+impl BTreeStore {
+    pub fn new(file_path: &Path, max_degree: u16) -> Result<Self, BTreeStoreError> {
+        if max_degree < 4 {
+            return Err(BTreeStoreError { msg: "BTreeStore must have at least a max degree of 4".to_owned() });
+        }
+
+        // check if file already exists
+        let store_meta_data;
+        let file_meta_data = fs::metadata(file_path)
+            .map_err(|err| BTreeStoreError { msg: err.to_string() })?;
+        let file_size = file_meta_data.len();
+
+        let file = match OpenOptions::new().read(true).write(true).open(file_path) {
+            Ok(mut f) if file_size >= META_DATA_HEADER_SIZE as u64 => {
+                let mut metadata_bytes = [0u8; META_DATA_HEADER_SIZE];
+                f.read_exact(&mut metadata_bytes).expect("Cannot read meta data from file");
+
+                let max_degree = u16::from_be_bytes(metadata_bytes[0..2].try_into().unwrap());
+                let number_of_pages = u32::from_be_bytes(metadata_bytes[2..6].try_into().unwrap());
+                let first_deleted_page = u32::from_be_bytes(metadata_bytes[6..10].try_into().unwrap());
+                let root = u32::from_be_bytes(metadata_bytes[10..14].try_into().unwrap());
+
+                store_meta_data = StoreMetaData {
+                    max_degree,
+                    number_of_pages,
+                    first_deleted_page: read_u32_with_null(first_deleted_page),
+                    root: read_u32_with_null(root),
+                    changed: false,
+                    unique_index: true,
+                };
+
+                f
+            }
+            _ => {
+                let mut f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(file_path)
+                    .expect("Failed to create file");
+
+                store_meta_data = StoreMetaData { 
+                    max_degree,
+                    number_of_pages: 0,
+                    first_deleted_page: None,
+                    root: None,
+                    changed: false,
+                    unique_index: true,
+                };
+                
+                let metadata_bytes = meta_data_to_bytes(&store_meta_data);
+
+                f.write_all(&metadata_bytes).expect("Failed to write metadata");
+                f.flush().expect("Failed to flush metadata on INIT");
+
+                f
+            }
+        };
+
+        let rc_meta_data = Rc::new(RefCell::new(store_meta_data));
+
+        Ok(BTreeStore { 
+            pager: NodePager::new(file, Rc::clone(&rc_meta_data)), 
+            meta_data: rc_meta_data
+        })
+    }
+
+    #[allow(dead_code)]
+    fn page_size(&self) -> u32 {
+        self.pager.page_size()
+    }
+
+    #[cfg(test)]
+    pub fn print_nodes(&self) {
+        match self.root() {
+            Ok(r) => r.print_all_nodes(&self.pager),
+            _ => (),
+        }
+    }
+
+    pub fn next_node(&self, node: &NodePage) -> Result<Option<NodePage>, BTreeStoreError> {
+        if let Some(page_id) = node.next_leaf() {
+            Ok(Some(self.pager.read_page(*page_id)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn find_smaller_than(&self, key: u32, with_equal: bool) -> Result<Vec<u32>, BTreeStoreError> {
+        let mut result = Vec::new();
+        let mut node = self.find_left_most_node()?;
+        let target_node = self.find_node(key)?;
+
+        if let Some(target_node) = target_node {
+            while let Some(next) = node {
+
+                if *target_node.id() == *next.id() {
+                    for i in 0..next.keys().len() {
+                        if next.keys()[i] < key || (with_equal && next.keys()[i] == key) {
+                            result.push(next.values()[i]);
+                        }
+                    }
+                    break;
+                } else {
+                    result.extend(next.values());
+                }
+
+                node = self.next_node(&next)?
+            }
+        }
+        
+        Ok(result)
+    }
+
+    pub fn find_greater_than(&self, key: u32, with_equal: bool) -> Result<Vec<u32>, BTreeStoreError> {
+        let mut result = Vec::new();
+        let mut node = self.find_node(key)?;
+        
+        let mut start_node = true;
+        while let Some(next) = node {
+            if start_node {
+                // The first node might contain multiple keys that are smaller than the key being searched for
+                for i in 0..next.keys().len() {
+                    if next.keys()[i] > key || (with_equal && next.keys()[i] == key) {
+                        result.push(next.values()[i]);
+                    }
+                }
+                start_node = false;
+            } else {
+                result.extend_from_slice(next.values());
+            }
+            
+            node = self.next_node(&next)?
+        }
+
+        Ok(result)
+    }
+
+    pub fn find_left_most_node(&self) -> Result<Option<NodePage>, BTreeStoreError> {
+        let root = self.root()?;
+
+        if let Some(page_id) = root.find_left_most_node(&self.pager)? {
+            Ok(Some(self.pager.read_page(page_id)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn find_node(&self, key: u32) -> Result<Option<NodePage>, BTreeStoreError> {
+        let root = self.root()?;
+
+        if let Some(page_id) = root.find_node(&self.pager, key)? {
+            Ok(Some(self.pager.read_page(page_id)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn find(&self, key: u32) -> Result<Option<u32>, BTreeStoreError> {
+        let root = self.root()?;
+
+        Ok(root.find_value(&self.pager, key)?)
+    }
+
+    pub fn insert(&mut self, key: u32, value: u32) -> Result<(), BTreeStoreError> {
+        let mut root = self.root()?;
+        if root.is_full() {
+            let (rnode, root_key) = root.split(&self.pager)?;
+            let mut new_root = self.pager.allocate_new_page()
+                .map_err(|_| BTreeStoreError { msg: "Cannot allocate new page (op: insert)".to_owned() })?;
+            new_root.keys_mut().push(root_key);
+            // root becomes the left node
+            new_root.children_mut().push(*root.id());
+            new_root.children_mut().push(*rnode.id());
+            
+            self.meta_data.borrow_mut().root = Some(*new_root.id());
+        
+            // for the insert: set variable root to new_root
+            root = new_root;
+            *root.changed().borrow_mut() = true;
+        }
+
+        let unique = self.meta_data.borrow().unique_index;
+        root.insert(&self.pager, key, value, unique)?;
+        self.pager.write_page(&root)
+                .map_err(|_| BTreeStoreError { msg: "Cannot write new root (op: insert)".to_owned() })?;
+
+        self.save_metadata()?;
+
+        Ok(())
+    }
+
+    pub fn delete(&mut self, key: u32) -> Result<Option<u32>, BTreeStoreError> {
+        let mut root = self.root()?;
+        let res = root.delete(&self.pager, key)?;
+
+        if root.keys().is_empty() && !root.is_leaf() {
+            // Special case where keys are empty and children has length 1 (after merging)
+            debug_assert_eq!(root.children().len(), 1, "Internal root node must have exactly 1 child when it is out of keys");
+            let new_root = root.children_mut().remove(0);
+            root = self.pager.read_page(new_root)?;
+            self.meta_data.borrow_mut().root = Some(new_root);
+        }
+
+        self.pager.write_page(&root)?;
+        self.save_metadata()?;
+
+        Ok(res)
+    }
+
+    fn save_metadata(&self) -> Result<(), BTreeStoreError> {
+        let changed = self.meta_data.borrow().changed;
+
+        if changed {
+            let bytes = meta_data_to_bytes(&self.meta_data.borrow());
+            let mut file = self.pager.file.borrow_mut();
+
+            file.seek(std::io::SeekFrom::Start(0))
+                .map_err(|_| BTreeStoreError { msg: "Cannot seek in file (saving StoreMetaData)".to_owned() })?;
+            file.write_all(&bytes)
+                .map_err(|_| BTreeStoreError { msg: "Cannot save StoreMetaData".to_owned() })?;
+        }
+        
+        Ok(())
+    }
+
+    pub fn root(&self) -> Result<NodePage, BTreeStoreError> {
+        let root = self.meta_data.borrow().root;
+
+        match root {
+            Some(root_id) => Ok(self.pager.read_page(root_id)?),
+            None => {
+                let new_root = self.pager.allocate_new_page()?;
+                self.meta_data.borrow_mut().root = Some(*new_root.id());
+                self.save_metadata()?;
+                Ok(new_root)
+            },
+        }
+
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::NamedTempFile;
+
+    use crate::tree::{store::BTreeStore, node::NodePage};
+
+    #[test]
+    fn find_left_most_node() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+        btree.insert(2, 2).unwrap();
+        btree.insert(5, 5).unwrap();      
+        btree.insert(100, 100).unwrap();
+        btree.insert(3, 3).unwrap();
+        btree.insert(4, 4).unwrap();
+        btree.insert(50, 50).unwrap();
+        btree.insert(20, 20).unwrap();
+
+        let mut node = btree.find_left_most_node().unwrap().unwrap();
+        assert_eq!(node.keys(), &vec![1u32]);
+    }
+
+    #[test]
+    fn find_all_smaller_than() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+        btree.insert(2, 2).unwrap();
+        btree.insert(5, 5).unwrap();      
+        btree.insert(100, 100).unwrap();
+        btree.insert(3, 3).unwrap();
+        btree.insert(4, 4).unwrap();
+        btree.insert(50, 50).unwrap();
+        btree.insert(20, 20).unwrap();
+        btree.insert(6, 6).unwrap();
+        btree.insert(7, 7).unwrap();
+        btree.insert(8, 8).unwrap();
+
+        let mut result = btree.find_smaller_than(20, true).unwrap();
+        assert_eq!(result, vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 20]);
+
+        let mut result = btree.find_smaller_than(20, false).unwrap();
+        assert_eq!(result, vec![1, 2, 3, 4, 5, 6, 7, 8, 10]);
+    }
+
+
+
+    #[test]
+    fn find_all_greater_than() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+        btree.insert(2, 2).unwrap();
+        btree.insert(5, 5).unwrap();      
+        btree.insert(100, 100).unwrap();
+        btree.insert(3, 3).unwrap();
+        btree.insert(4, 4).unwrap();
+        btree.insert(50, 50).unwrap();
+        btree.insert(20, 20).unwrap();
+        btree.insert(6, 6).unwrap();
+        btree.insert(7, 7).unwrap();
+        btree.insert(8, 8).unwrap();
+
+        let mut result = btree.find_greater_than(7, true).unwrap();
+        assert_eq!(result, vec![7, 8, 10, 20, 50, 100]);
+
+        let mut result = btree.find_greater_than(7, false).unwrap();
+        assert_eq!(result, vec![8, 10, 20, 50, 100]);
+    }
+
+    #[test]
+    fn delete_everything_except_one_key() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+        btree.insert(2, 2).unwrap();
+        btree.insert(5, 5).unwrap();
+        btree.insert(100, 100).unwrap();
+
+        btree.delete(1).unwrap();
+        btree.delete(10).unwrap();
+        btree.delete(2).unwrap();
+        btree.delete(5).unwrap();
+
+        let row_page = btree.find(100).unwrap();
+
+        assert!(row_page.is_some());
+        assert_eq!(row_page.unwrap(), 100);
+
+        let row_page = btree.find(5).unwrap();
+        assert!(row_page.is_none());
+
+        let row_page = btree.find(2).unwrap();
+        assert!(row_page.is_none());
+
+    }
+
+    #[test]
+    fn insert_delete_find() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+        btree.insert(2, 2).unwrap();
+        btree.insert(5, 5).unwrap();
+        btree.insert(100, 100).unwrap();
+
+        let row_page = btree.find(2).unwrap();
+
+        assert!(row_page.is_some());
+        assert_eq!(row_page.unwrap(), 2);
+
+        // delete key=2 => merge happens: lend key 5 from right node before delete
+        let deleted_value = btree.delete(2).unwrap();
+        assert!(deleted_value.is_some());
+        assert_eq!(deleted_value.unwrap(), 2);
+
+        // try to delete key=2 again will merge the middle with the right node again
+        let deleted_value = btree.delete(2).unwrap();
+        assert!(deleted_value.is_none());
+        // should have lend two times from right node [5, 10, 100], so [5, 10] is on the middle and [100] is on the right, key parent should be 100.
+        // Try to find the lend key 5 in middle node:
+        let row_page = btree.find(5).unwrap();
+
+        assert!(row_page.is_some());
+        assert_eq!(row_page.unwrap(), 5);
+
+        // Try to find a value in the right most node after parents key has been updated:
+        let row_page = btree.find(100).unwrap();
+
+        assert!(row_page.is_some());
+        assert_eq!(row_page.unwrap(), 100);
+    }
+
+    #[test]
+    fn insert_and_find() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+        btree.insert(2, 2).unwrap();
+        btree.insert(5, 5).unwrap();
+        btree.insert(100, 100).unwrap();
+        btree.insert(3, 3).unwrap();
+        btree.insert(4, 4).unwrap();
+
+        let row_page = btree.find(100).unwrap();
+
+        assert!(row_page.is_some());
+        assert_eq!(row_page.unwrap(), 100);
+    }
+
+    #[test]
+    fn insert_and_find_in_root_only() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
+        btree.insert(1, 1).unwrap();
+        btree.insert(10, 10).unwrap();
+
+        let row_page = btree.find(1).unwrap();
+
+        assert!(row_page.is_some());
+        assert_eq!(row_page.unwrap(), 1);
+    }
+
+
+    #[test]
+    fn get_root() {
+        let temp = NamedTempFile::new().unwrap();
+        let btree= BTreeStore::new(temp.path(), 10).unwrap();
+        let root_res = btree.root();
+        assert!(root_res.is_ok());
+        let root = root_res.unwrap();
+        assert_eq!(*root.id(), 0);
+        assert_eq!(*root.deleted(), false);
+        assert!(root.keys().is_empty());
+        assert!(root.children().is_empty());
+        assert!(root.values().is_empty());
+    }
+
+    #[test]
+    fn reallocate_deleted_page() {
+        // Arrange
+        let temp = NamedTempFile::new().unwrap();
+        let btree= BTreeStore::new(temp.path(), 10).unwrap();
+        // allocate page1
+        let mut page1 = btree.pager.allocate_new_page().unwrap();
+        page1.keys_mut().push(1);
+        page1.keys_mut().push(5);
+        btree.pager.write_page(&page1).unwrap();
+
+        // allocate page2
+        let mut page2 = btree.pager.allocate_new_page().unwrap();
+        page2.keys_mut().push(7);
+        page2.keys_mut().push(10);
+        btree.pager.write_page(&page2).unwrap();
+
+        // delete page2
+        btree.pager.delete_page(*page2.id()).unwrap();
+        btree.save_metadata().unwrap();
+        
+        // Act
+        // should now allocate the delete page page2 (id=1)
+        let allocated1 = btree.pager.allocate_new_page().unwrap();
+        // should allocate a new page
+        let allocated2 = btree.pager.allocate_new_page().unwrap();
+
+        // Assert
+        assert_eq!(*allocated1.id(), 1);
+        assert_eq!(*allocated1.deleted(), false);
+        assert_eq!(*allocated1.next_deleted_page(), None);
+        assert!(allocated1.keys().is_empty());
+        assert!(allocated1.values().is_empty());
+
+
+        assert_eq!(*allocated2.id(), 2);
+        assert_eq!(*allocated2.deleted(), false);
+        assert_eq!(*allocated2.next_deleted_page(), None);
+    }
+
+    #[test]
+    fn write_and_read_pages() {
+        let page1 = NodePage::new_from_store(
+            0, false, 
+            None, vec![1, 5, 6],
+            vec![3, 9, 10, 16], Vec::new(),
+            None, 4
+        );
+
+        *page1.changed().borrow_mut() = true;
+
+        let temp = NamedTempFile::new().unwrap();
+        let btree= BTreeStore::new(temp.path(), 10).unwrap();
+        btree.pager.write_page(&page1).unwrap();
+
+        let page1_loaded = btree.pager.read_page(0).unwrap();
+
+        assert_eq!(*page1_loaded.id(), 0);
+        assert_eq!(*page1_loaded.deleted(), false);
+        assert_eq!(*page1_loaded.next_deleted_page(), None);
+        assert_eq!(*page1_loaded.keys(), vec![1, 5, 6]);
+        assert_eq!(*page1_loaded.children(), vec![3, 9, 10, 16]);
+        assert!(page1_loaded.values().is_empty());
+
+        // page 2:
+        let page2 = NodePage::new_from_store(
+            1, false, 
+            None, vec![7, 8],
+            Vec::new(), vec![1, 2],
+            None, 4
+        );
+        *page2.changed().borrow_mut() = true;
+        btree.pager.write_page(&page2).unwrap();
+        let page2_loaded = btree.pager.read_page(1).unwrap();
+
+        assert_eq!(*page2_loaded.id(), 1);
+        assert_eq!(*page2_loaded.deleted(), false);
+        assert_eq!(*page2_loaded.next_deleted_page(), None);
+        assert_eq!(*page2_loaded.keys(), vec![7, 8]);
+        assert_eq!(*page2_loaded.values(), vec![1, 2]);
+    }
+
+    #[test]
+    fn max_degree_should_be_at_least_4() {
+        let temp = NamedTempFile::new().unwrap();
+        let btree = BTreeStore::new(temp.path(), 0);
+        assert!(btree.is_err());
+        let btree = BTreeStore::new(temp.path(), 3);
+        assert!(btree.is_err());
+        let btree = BTreeStore::new(temp.path(), 4);
+        assert!(btree.is_ok());
+        assert_eq!(btree.unwrap().page_size(), 53) // 9 + 4*4 + 3*4 + 3*4 + 4 = 53
+    }
+
+    #[test]
+    fn create_new_btree_store() {
+        let temp = NamedTempFile::new().unwrap();
+        let btree= BTreeStore::new(temp.path(), 10).unwrap();
+        let meta_data = btree.meta_data.borrow();
+        assert_eq!(meta_data.first_deleted_page, None);
+        assert_eq!(meta_data.max_degree, 10);
+        assert_eq!(meta_data.number_of_pages, 0);
+        
+        // Open existing BTree with some random degree
+        let btree= BTreeStore::new(temp.path(), 100).unwrap();
+        let meta_data = btree.meta_data.borrow();
+        assert_eq!(meta_data.first_deleted_page, None);
+        assert_eq!(meta_data.max_degree, 10); // Use the degree from meta data section
+        assert_eq!(meta_data.number_of_pages, 0);
+        assert_eq!(btree.page_size(), 125) // 9 + 10*4 + 9*4 + 9*4 + 4 = 125
+    }
+
+}
