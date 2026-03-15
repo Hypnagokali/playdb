@@ -1,6 +1,9 @@
 use std::{cell::RefCell, fs::{self, File, OpenOptions}, io::{Read, Seek, Write}, path::Path, rc::Rc, u32};
 
 use thiserror::Error;
+use ttl_cache::TtlCache;
+
+use crate::tree::node::NodeOperationError;
 
 use super::{get_u32_be_bytes_from_option, node::NodePage, read_u32_with_null};
 
@@ -73,6 +76,7 @@ pub struct StoreMetaData {
     first_deleted_page: Option<u32>,
     root: Option<u32>,
     changed: bool, // will not be serialized, is only a flag, if NodePager has changed the meta data
+    unique_index: bool, // not serialized yet, because I only deal with unique indexes at the moment (so it's always true)
 }
 
 impl StoreMetaData {
@@ -172,7 +176,8 @@ impl From<(Vec<u8>, u16)> for NodePage {
 
 pub struct NodePager {
     file: RefCell<File>,
-    meta_data: Rc<RefCell<StoreMetaData>>
+    cache: RefCell<TtlCache<u32, NodePage>>,
+    meta_data: Rc<RefCell<StoreMetaData>>,
 }
 
 #[derive(Debug, Error)]
@@ -184,8 +189,10 @@ pub struct NodePagerError {
 
 impl NodePager {
     fn new(file: File, meta_data: Rc<RefCell<StoreMetaData>>) -> Self {
+        let cache = TtlCache::new(500);
         NodePager { 
             file: RefCell::new(file),
+            cache: RefCell::new(cache),
             meta_data,
         }
     }
@@ -255,10 +262,16 @@ impl NodePager {
 
         *node.changed().borrow_mut() = false;
 
+        self.cache.borrow_mut().remove(node.id());
+
         Ok(())
     }
 
     pub fn read_page(&self, page_id: u32) -> Result<NodePage, NodePagerError> {
+        if let Some(node) = self.cache.borrow().get(&page_id) {
+            // todo
+        }
+
         let mut file= self.file.borrow_mut();
         let mut data = vec![0; self.page_size() as usize];
         let offset = META_DATA_HEADER_SIZE as u32 + (self.page_size() * page_id);
@@ -332,6 +345,14 @@ impl From<NodePagerError> for BTreeStoreError {
     }
 }
 
+impl From<NodeOperationError> for BTreeStoreError {
+    fn from(value: NodeOperationError) -> Self {
+        Self {
+            msg: format!("BTreeStoreError occurred. err={}", value),
+        }
+    }
+}
+
 impl BTreeStore {
     pub fn new(file_path: &Path, max_degree: u16) -> Result<Self, BTreeStoreError> {
         if max_degree < 4 {
@@ -360,6 +381,7 @@ impl BTreeStore {
                     first_deleted_page: read_u32_with_null(first_deleted_page),
                     root: read_u32_with_null(root),
                     changed: false,
+                    unique_index: true,
                 };
 
                 f
@@ -378,6 +400,7 @@ impl BTreeStore {
                     first_deleted_page: None,
                     root: None,
                     changed: false,
+                    unique_index: true,
                 };
                 
                 let metadata_bytes = meta_data_to_bytes(&store_meta_data);
@@ -402,6 +425,7 @@ impl BTreeStore {
         self.pager.page_size()
     }
 
+    #[cfg(test)]
     pub fn print_nodes(&self) {
         match self.root() {
             Ok(r) => r.print_all_nodes(&self.pager),
@@ -470,7 +494,7 @@ impl BTreeStore {
     pub fn find_left_most_node(&self) -> Result<Option<NodePage>, BTreeStoreError> {
         let root = self.root()?;
 
-        if let Some(page_id) = root.find_left_most_node(&self.pager) {
+        if let Some(page_id) = root.find_left_most_node(&self.pager)? {
             Ok(Some(self.pager.read_page(page_id)?))
         } else {
             Ok(None)
@@ -480,7 +504,7 @@ impl BTreeStore {
     pub fn find_node(&self, key: u32) -> Result<Option<NodePage>, BTreeStoreError> {
         let root = self.root()?;
 
-        if let Some(page_id) = root.find_node(&self.pager, key) {
+        if let Some(page_id) = root.find_node(&self.pager, key)? {
             Ok(Some(self.pager.read_page(page_id)?))
         } else {
             Ok(None)
@@ -490,13 +514,13 @@ impl BTreeStore {
     pub fn find(&self, key: u32) -> Result<Option<u32>, BTreeStoreError> {
         let root = self.root()?;
 
-        Ok(root.find_value(&self.pager, key))
+        Ok(root.find_value(&self.pager, key)?)
     }
 
     pub fn insert(&mut self, key: u32, value: u32) -> Result<(), BTreeStoreError> {
         let mut root = self.root()?;
         if root.is_full() {
-            let (rnode, root_key) = root.split(&self.pager);
+            let (rnode, root_key) = root.split(&self.pager)?;
             let mut new_root = self.pager.allocate_new_page()
                 .map_err(|_| BTreeStoreError { msg: "Cannot allocate new page (op: insert)".to_owned() })?;
             new_root.keys_mut().push(root_key);
@@ -511,9 +535,8 @@ impl BTreeStore {
             *root.changed().borrow_mut() = true;
         }
 
-        
-        
-        root.insert(&self.pager, key, value);
+        let unique = self.meta_data.borrow().unique_index;
+        root.insert(&self.pager, key, value, unique)?;
         self.pager.write_page(&root)
                 .map_err(|_| BTreeStoreError { msg: "Cannot write new root (op: insert)".to_owned() })?;
 
@@ -524,7 +547,7 @@ impl BTreeStore {
 
     pub fn delete(&mut self, key: u32) -> Result<Option<u32>, BTreeStoreError> {
         let mut root = self.root()?;
-        let res = root.delete(&self.pager, key);
+        let res = root.delete(&self.pager, key)?;
 
         if root.keys().is_empty() && !root.is_leaf() {
             // Special case where keys are empty and children has length 1 (after merging)
