@@ -1,4 +1,4 @@
-use std::{cell::RefCell, fs::{self, File, OpenOptions}, io::{Read, Seek, Write}, path::Path, rc::Rc, u32};
+use std::{cell::RefCell, fs::{self, File, OpenOptions}, io::{Read, Seek, Write}, path::Path, rc::Rc, time::Duration, u32};
 
 use thiserror::Error;
 use ttl_cache::TtlCache;
@@ -262,14 +262,14 @@ impl NodePager {
 
         *node.changed().borrow_mut() = false;
 
-        self.cache.borrow_mut().remove(node.id());
+        self.cache.borrow_mut().insert(*node.id(), node.clone(), Duration::from_secs(120));
 
         Ok(())
     }
 
     pub fn read_page(&self, page_id: u32) -> Result<NodePage, NodePagerError> {
         if let Some(node) = self.cache.borrow().get(&page_id) {
-            // todo
+            return Ok(node.clone());
         }
 
         let mut file= self.file.borrow_mut();

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, mem, u32};
+use std::{cell::RefCell, mem, rc::Rc, u32};
 
 use derive_getters::Getters;
 use thiserror::Error;
@@ -29,7 +29,13 @@ impl From<NodePagerError> for NodeOperationError {
     }
 }
 
-#[derive(Debug, Getters)]
+
+// The clone method is only used for retrieving a Node from cache.
+// It's cheaper than to read from file, but far away from perfect.
+// A better alternative would be to wrap an inner Rc,
+// but it's going to take a bit of effort, because of the inner mutability.
+// So I've put it off for now :)
+#[derive(Debug, Getters, Clone)]
 pub struct NodePage {
     id: u32, // u32::MAX is a new page
     deleted: bool,
@@ -39,7 +45,7 @@ pub struct NodePage {
     values: Vec<u32>, // each item points to a page of rows
     next_leaf: Option<u32>, // Linked list to next leaf-node (if leaf) 
     max_degree: usize,
-    changed: RefCell<bool>, // flag is not stored, indicates, if the node has been changed
+    changed: Rc<RefCell<bool>>, // flag is not stored, indicates, if the node has been changed
     // next_leaf: Option<u32> TODO: linked list between leaves
 }
 
@@ -89,7 +95,7 @@ impl NodePage {
             children: Vec::new(),
             next_leaf: None,
             max_degree,
-            changed: RefCell::new(true),
+            changed: Rc::new(RefCell::new(true)),
         }
     }
 
@@ -112,7 +118,7 @@ impl NodePage {
             values,
             next_leaf,
             max_degree,
-            changed: RefCell::new(false),
+            changed: Rc::new(RefCell::new(false)),
         }
 
     }
