@@ -1,5 +1,12 @@
-mod schema;
+// ignore dead_code while developing
+#[allow(dead_code)]
+mod table;
+#[allow(dead_code)]
 mod data;
+#[allow(dead_code)]
+mod store;
+#[allow(dead_code)]
+mod database;
 #[allow(unused)]
 mod tree;
 
