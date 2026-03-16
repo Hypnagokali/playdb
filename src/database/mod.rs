@@ -15,6 +15,7 @@ impl<S: Store> Database<S> {
         }
     }
     fn init(&self) {
+        // create sequence for tables, columns, indexes
         // create class, attribute and index tables
         // must generate PageDataLayout and store it somewhere
     }

@@ -1,3 +1,9 @@
+//! This is a very simple implementation of a B+ Tree page.
+//! Since it is just for analyzing how a database may work internally, a simple integer key index is sufficient.
+//! Actually, the B+ Tree should be also stored in the generic page,
+//! Usually, a node would be split by page size, not by number of keys, 
+//! because a key may have a variable size (strings, composites).
+//! See (2026-03-16): https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README#L160
 use std::{cell::RefCell, mem, rc::Rc, u32};
 
 use derive_getters::Getters;

@@ -224,7 +224,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
 mod tests {
     use tempfile::tempdir;
 
-    use crate::{data::page::PageDataLayout, database::access::TableAccess, store::file_store::FileStore, table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}};
+    use crate::{data::page::PageDataLayout, database::access::TableAccess, store::{Store, file_store::FileStore}, table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}};
 
 
     #[test]
@@ -237,7 +237,8 @@ mod tests {
         let base_dir = tempdir().unwrap();
         let store = FileStore::new(base_dir.path());
         let layout = PageDataLayout::new(64).unwrap();
-
+        store.create(&layout, &table).unwrap();
+        
         let access = TableAccess::new(&table, &store, &layout);
 
         let first_row = Row::new(vec![
@@ -267,6 +268,8 @@ mod tests {
         let base_dir = tempdir().unwrap();
         let store = FileStore::new(base_dir.path());
         let layout = PageDataLayout::new(64).unwrap();
+
+        store.create(&layout, &table).unwrap();
 
         let access = TableAccess::new(&table, &store, &layout);
 
@@ -301,6 +304,8 @@ mod tests {
         let base_dir = tempdir().unwrap();
         let store = FileStore::new(base_dir.path());
         let layout = PageDataLayout::new(64).unwrap();
+        
+        store.create(&layout, &table).unwrap();
 
         let access = TableAccess::new(&table, &store, &layout);
 
@@ -339,6 +344,7 @@ mod tests {
         let store = FileStore::new(base_dir.path());
         let layout = PageDataLayout::new(64).unwrap();
 
+        store.create(&layout, &table).unwrap();
         let access = TableAccess::new(&table, &store, &layout);
 
         let first_row = Row::new(vec![
@@ -372,6 +378,7 @@ mod tests {
         let store = FileStore::new(base_dir.path());
         let layout: PageDataLayout = PageDataLayout::new(1024).unwrap();
 
+        store.create(&layout, &person_table).unwrap();
         let person_access = TableAccess::new(&person_table, &store, &layout);
 
         let first_person = Row::new(vec![
@@ -393,6 +400,8 @@ mod tests {
         ]);
 
         let address_table = Table::new(2, "addresses".to_owned(), address_schema);
+        store.create(&layout, &address_table).unwrap();
+
         let address_access = TableAccess::new(&address_table, &store, &layout);
 
         let first_address = Row::new(vec![

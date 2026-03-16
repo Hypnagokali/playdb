@@ -1,4 +1,4 @@
-use std::{io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
+use std::{fs::remove_file, io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
 
 use crate::{data::page::{Page, PageDataLayout, PageFileMetadata}, store::{Store, StoreError}, table::table::Table};
 
@@ -18,6 +18,13 @@ impl<'a> FileStore<'a> {
 
     fn file_path(&self, table: &Table) -> PathBuf {
         self.base_path.join(table.file_path())
+    }
+
+    fn delete_file(&self, table: &Table) -> Result<(), StoreError> {
+        remove_file(Path::new(&table.file_path()))
+            .map_err(|e| StoreError::IoError(e.to_string()))?;
+
+        Ok(())
     }
 
     fn init(&self, layout: &PageDataLayout, table: &Table) -> Result<(), StoreError> {
@@ -40,7 +47,7 @@ impl<'a> Store for FileStore<'a> {
     fn read_metadata(&self, layout: &PageDataLayout, table: &Table) -> Result<PageFileMetadata, StoreError> {
         let path: PathBuf = self.file_path(table);
         if !path.exists() {
-            self.init(layout, table)?;
+            return Err(StoreError::IoError(format!("No such data structure '{}' found (forget to call create?)", table.file_path())));
         }
 
         let mut file = std::fs::OpenOptions::new()
@@ -96,6 +103,14 @@ impl<'a> Store for FileStore<'a> {
         self.write_page(layout, &new_page, table)?;
         Ok(new_page)
     }
+    
+    fn create(&self, layout: &PageDataLayout, table: &Table) -> Result<(), StoreError> {
+        self.init(layout, table)
+    }
+    
+    fn delete(&self, table: &Table) -> Result<(), StoreError> {
+        self.delete_file(table)
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +156,7 @@ mod tests {
 
         let table = Table::new(1, "test".to_owned(), schema);
 
+        store.create(&layout, &table).unwrap();
         let mut new_page = store.allocate_page(&layout, &table).unwrap();
         assert_eq!(new_page.page_id(), 1);
 
@@ -173,6 +189,7 @@ mod tests {
 
         let table = Table::new(1, "test".to_owned(), schema);
 
+        store.create(&layout, &table).unwrap();
         // Create first page (stays empty)
         let first_page = store.allocate_page(&layout, &table).unwrap();
         assert_eq!(first_page.page_id(), 1);
@@ -209,6 +226,7 @@ mod tests {
         ]);
         let table = Table::new(1, "test".to_owned(), schema);
 
+        store.create(&layout, &table).unwrap();
         // Create page for sequences
         let mut seq_page = store.allocate_page(&layout, &table).unwrap();
 
@@ -241,6 +259,7 @@ mod tests {
 
         let table = Table::new(1, "test".to_owned(), schema);
 
+        store.create(&layout, &table).unwrap();
         let mut new_page = store.allocate_page(&layout, &table).unwrap();
         assert_eq!(new_page.page_id(), 1);
 

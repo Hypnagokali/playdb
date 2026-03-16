@@ -8,6 +8,8 @@ use crate::{data::page::{Page, PageDataLayout, PageFileMetadata, Record, RecordI
 pub trait Store {
     // fn store_layout(&self, layout: &PageDataLayout, database: &Database);
     // fn load_layout(&self, database: &Database) -> PageDataLayout;
+    fn create(&self, layout: &PageDataLayout, table: &Table) -> Result<(), StoreError>;
+    fn delete(&self, table: &Table) -> Result<(), StoreError>;
     fn read_metadata(&self, layout: &PageDataLayout, table: &Table) -> Result<PageFileMetadata, StoreError>;
     fn read_page<'db>(&self, layout: &'db PageDataLayout, page_id: i32, table: &Table) -> Result<Page<'db>, StoreError>;
     fn write_page(&self, layout: &PageDataLayout, page: &Page, table: &Table) -> Result<(), StoreError>;
