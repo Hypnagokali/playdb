@@ -226,6 +226,8 @@ pub enum PageError {
     InsertRowError,
     #[error("Failed to read page from file.")]
     ReadPageError,
+    #[error("Failed to update record")]
+    UpdateRecordError,
 }
 
 #[cfg(target_pointer_width = "64")] // so that I can use always 8 bytes for usize
@@ -292,6 +294,25 @@ impl<'database> Page<'database> {
         row_bytes.len() <= self.space_remaining() && row_bytes.len() <= PageDataLayout::MAX_ROW_LENGTH as usize
     }
 
+    /// Update in place
+    /// Only possible if the length hasn't changed
+    pub fn write_record(&mut self, record_index: usize, row_bytes: Vec<u8>) -> Result<(), PageError> {
+        let slot = self.slots.get_mut(record_index);
+
+        if let Some(slot) = slot {
+            if slot.record_length != row_bytes.len() as u16 {
+                // Cannot update in place if length differ
+                return Err(PageError::UpdateRecordError);
+            }
+
+            let end_of_data = slot.page_offset + row_bytes.len();
+            self.data[slot.page_offset..end_of_data].copy_from_slice(&row_bytes);
+            Ok(())
+        } else {
+            Err(PageError::UpdateRecordError)
+        }
+    }
+
     pub fn insert_record(&mut self, row_bytes: Vec<u8>) -> Result<(), PageError> {
         if !self.can_insert(&row_bytes) {
             return Err(PageError::InsertRowError);
@@ -299,34 +320,34 @@ impl<'database> Page<'database> {
 
         let new_record_len = row_bytes.len() as u16; // size already checked
 
-        let slot = self.slots.iter_mut()
+        let deleted_slot = self.slots.iter_mut()
             .find(|s| s.record_length >= new_record_len && s.deleted);
 
 
-        let (new_slot_len, slot_data_start_offset) = if let Some(slot) = slot {
+        let (slot_deleted, new_slot_len, slot_data_start_offset) = if let Some(slot) = deleted_slot {
             let end_of_data = slot.page_offset + row_bytes.len();
             self.data[slot.page_offset..end_of_data].copy_from_slice(&row_bytes);
 
             // Need a new slot if the length of the inserted record is not as long as the slot
-            let new_slot_len = new_record_len - slot.record_length;
+            let remaining_slot_len = slot.record_length - new_record_len;
 
-            if new_slot_len == 0 {
-                slot.deleted = false;
-            } else {
+            if remaining_slot_len > 0 {
                 slot.record_length = new_record_len;
             }
 
-            (new_slot_len, end_of_data)
+            slot.deleted = false;
+
+            (true, remaining_slot_len, end_of_data)
         } else {
             let start_of_data = self.data_offset - row_bytes.len();
             self.data[start_of_data..self.data_offset].copy_from_slice(&row_bytes);
             self.data_offset -= row_bytes.len();
 
-            (row_bytes.len() as u16, start_of_data)
+            (false, row_bytes.len() as u16, start_of_data)
         };
 
         if new_slot_len > 0 {
-            self.allocate_slot(slot_data_start_offset, new_record_len);
+            self.allocate_slot(slot_data_start_offset, new_record_len, slot_deleted);
         }
     
         self.number_of_records += 1;
@@ -334,8 +355,11 @@ impl<'database> Page<'database> {
         Ok(())
     }
 
-    fn allocate_slot(&mut self, page_offset: usize, record_length: u16) {
-        self.slots.push(Slot { record_length, page_offset, deleted: false });
+    fn allocate_slot(&mut self, page_offset: usize, record_length: u16, deleted: bool) {
+        // It's possible to allocate deleted slot
+        // for example, if a deleted slot has been overwritten with a smaller record,
+        // the remaining free space can be allocated as a new slot
+        self.slots.push(Slot { record_length, page_offset, deleted });
     }
 
     pub fn delete_record(&mut self, record_index: usize) -> bool {
@@ -347,6 +371,10 @@ impl<'database> Page<'database> {
         } else {
             false
         }
+    }
+
+    fn read_data(&self, slot: &Slot) -> &[u8] {
+        &self.data[slot.page_offset..slot.page_offset + slot.record_length as usize]
     }
 
     pub fn serialize(&self) -> Vec<u8> {
@@ -442,6 +470,52 @@ impl<'database> Page<'database> {
 #[cfg(test)]
 mod tests {
     use crate::data::page::{Page, PageDataLayout, PageDataLayoutError};
+
+    #[test]
+    fn should_insert_new_data_in_deleted_slot_if_it_fits() {
+        let layout = PageDataLayout::new(64).unwrap();
+        let mut page = Page::new(&layout);
+
+        page.insert_record(vec![1, 2, 1, 2]).unwrap();
+        page.insert_record(vec![2, 4, 2, 4]).unwrap();
+        page.insert_record(vec![3, 5, 3, 5]).unwrap();
+        
+        page.delete_record(1);
+        page.insert_record(vec![9, 9, 9]).unwrap();
+
+        // A new slot with size 1 has been created, because the new record didn't fit perfectly
+        assert_eq!(page.slots.len(), 4);
+        assert_eq!(page.slots[3].deleted, true);
+
+        page.insert_record(vec![10]).unwrap();
+        assert_eq!(page.slots[3].deleted, false);
+        assert_eq!(page.read_data(&page.slots[3]), [10]);
+        
+        let record = page.record_iterator().find(|v| v.data.data()[0] == 9).unwrap();
+        assert_eq!(record.data.data(), &[9, 9, 9]);
+        assert_eq!(record.record_index, 1);        
+    }
+
+
+    #[test]
+    fn should_update_record_in_place() {
+        let layout = PageDataLayout::new(64).unwrap();
+        let mut page = Page::new(&layout);
+
+        page.insert_record(vec![1, 2, 1, 2]).unwrap();
+        page.insert_record(vec![2, 4, 2, 4]).unwrap();
+        page.insert_record(vec![3, 5, 3, 5]).unwrap();
+
+        let ser_page = page.serialize();
+        let record = page.record_iterator().find(|v| v.data.data()[0] == 2).unwrap();
+
+        let mut page = Page::deserialize(&ser_page, &layout);
+        page.write_record(record.record_index, vec![2, 2, 2, 2]).unwrap();
+        let record = page.record_iterator().find(|v| v.data.data()[0] == 2).unwrap();
+        assert_eq!(record.data.data(), &[2, 2, 2, 2]);
+        assert_eq!(record.record_index, 1);
+    }
+
 
     #[test]
     fn should_not_allow_page_layout_size_less_than_32() {

@@ -143,7 +143,8 @@ impl From<PageError> for TableAccessError {
     fn from(err: PageError) -> Self {
         match err {
             PageError::InsertRowError => TableAccessError::InsertRowError("Failed to insert row into page.".to_string()),
-            PageError::ReadPageError => TableAccessError::LoadRowsError("Failed to read page from file.".to_string()),
+            PageError::ReadPageError => TableAccessError::LoadRowsError("Failed to read page.".to_string()),
+            PageError::UpdateRecordError => TableAccessError::LoadRowsError("Failed to update page.".to_string()),
         }
     }
 }
@@ -224,7 +225,10 @@ impl<'db, S: Store> TableAccess<'db, S> {
 mod tests {
     use tempfile::tempdir;
 
-    use crate::{data::page::PageDataLayout, database::access::TableAccess, store::{Store, file_store::FileStore}, table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}};
+    use crate::{data::page::PageDataLayout, 
+        database::access::TableAccess, store::{Store, file_store::FileStore}, 
+        table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}
+    };
 
 
     #[test]
@@ -238,7 +242,7 @@ mod tests {
         let store = FileStore::new(base_dir.path());
         let layout = PageDataLayout::new(64).unwrap();
         store.create(&layout, &table).unwrap();
-        
+
         let access = TableAccess::new(&table, &store, &layout);
 
         let first_row = Row::new(vec![
