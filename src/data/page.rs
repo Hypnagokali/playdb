@@ -129,6 +129,7 @@ impl RecordData {
 
 #[derive(Debug)]
 pub struct Record {
+    page_id: i32,
     record_index: usize,
     data: RecordData,
 }
@@ -137,9 +138,14 @@ impl Record {
     pub fn data(&self) -> &[u8] {
         self.data.data()
     }
+
+    pub fn page_id(&self) -> &i32 {
+        &self.page_id
+    }
 }
 
 pub struct RecordIterator {
+    page_id: i32,
     data: Rc<Vec<u8>>,
     slots: Vec<Slot>,
     slot_index: usize,
@@ -149,6 +155,7 @@ impl RecordIterator {
 
     pub fn new(page: Page) -> Self {
         Self {
+            page_id: page.page_id(),
             data: Rc::new(page.data),
             slots: page.slots,
             slot_index: 0,
@@ -169,6 +176,7 @@ impl Iterator for RecordIterator {
 
                 let data_to = slot.page_offset + slot.record_length as usize;
                 let record = Record {
+                    page_id: self.page_id,
                     record_index: self.slot_index,
                     data: RecordData::new(Rc::clone(&self.data), slot.page_offset, data_to),
                 };
