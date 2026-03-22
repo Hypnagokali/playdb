@@ -16,6 +16,8 @@ pub enum TableAccessError {
     InsertRowError(String),
     #[error("TableAccessError - load error: {0}")]
     LoadRowsError(String),
+    #[error("TableAccessError - update error: {0}")]
+    UpdateRowsError(String),
 }
 
 pub struct QueryResult<'db, I> {
@@ -25,7 +27,7 @@ pub struct QueryResult<'db, I> {
 
 impl<'db, I> QueryResult<'db, I> {
     pub fn rows(self) -> Vec<I> {
-        self.row_iter.into_iter().map(|rec_row| rec_row).collect()
+        self.row_iter.into_iter().collect()
     }
 }
 
@@ -184,40 +186,105 @@ impl<'db, S: Store> TableAccess<'db, S> {
         }))
     }
 
-    // Currently maximally naive insert implementation
-    // Should be refactored, so that FSM is used to find pages with free space
-    pub fn insert(&self, row: &Row) -> Result<(), TableAccessError> {
-        row.validate(self.table.schema())?;
+    pub fn update(&mut self, query_result: QueryResult<(Record, Row)>, updates: Vec<(&str, Cell)>) -> Result<(), TableAccessError> {
+        if query_result.schema != *self.table.schema() {
+            return Err(TableAccessError::UpdateRowsError("QueryResult schema does not match table schema".to_string()));
+        }
 
+        let update_cells = updates.iter().map(|(col_name, cell)| {
+            let index = find_column_for_query_by_cell(&self.table.schema(), col_name, &cell)?;
+            Ok((index, cell.clone()))
+        }).collect::<Result<HashMap<usize, Cell>, TableAccessError>>()?;
+
+        let not_in_place_update = updates.iter().any(|(_, cell)| cell.column_type().is_var_size());
+
+        let mut updated_rows_map = HashMap::new();
+        for (record, row) in query_result.rows() {
+            let mut updated_cells = Vec::new();
+            for (queried_cell_index, queried_cell) in row.cells().iter().enumerate() {
+                if let Some(update_cell) = update_cells.get(&queried_cell_index) {
+                    updated_cells.push(update_cell.clone());
+                } else {
+                    updated_cells.push(queried_cell.clone());
+                }
+            }
+            let updated_row = Row::new(updated_cells);
+
+            let updated_rows_per_page = updated_rows_map.entry(*record.page_id()).or_insert(Vec::new());
+            updated_rows_per_page.push((record, updated_row));
+        }
+
+        let mut rows_needs_another_page = Vec::new();
+        // iterate over updated_rows_map and write back updated rows to pages
+        // in place or delete and reinsert
+        for (page_id, updated_rows) in updated_rows_map.into_iter() {
+            let mut page = self.store.read_page(self.layout, page_id, self.table)
+            .map_err(|e| TableAccessError::UpdateRowsError(e.to_string()))?;
+
+            if not_in_place_update {
+                // delete and reinsert
+                for (record, updated_row) in updated_rows {
+                    page.delete_record(*record.record_index());
+                    let row_data = updated_row.serialize();
+                    if page.can_insert(&row_data) {
+                        page.insert_record(row_data)?;
+                    } else {
+                        rows_needs_another_page.push(row_data);
+                    }
+
+                    self.store.write_page(self.layout, &page, self.table)
+                        .map_err(|_| TableAccessError::UpdateRowsError("Reinsert update error: cannot write page".to_string()))?
+                }
+            } else {
+                // easy peasy in place update
+                for (record, updated_row) in updated_rows {
+                    let row_data = updated_row.serialize();
+                    page.write_record(*record.record_index(), row_data)?;
+                    self.store.write_page(self.layout, &page, self.table)
+                        .map_err(|_| TableAccessError::UpdateRowsError("Write in place error: cannot write page".to_string()))?;
+                }
+            }
+        }
+
+        for updated_row_data in rows_needs_another_page {
+            self.raw_insert(updated_row_data)?;
+        }
+        
+        Ok(())
+    }
+
+    // Currently most naive insert implementation
+    // Should be refactored, so that FSM is used to find pages with free space
+    fn raw_insert(&self, row_data: Vec<u8>) -> Result<(), TableAccessError> {
         let page_iterator = self.store.page_iterator(self.layout, self.table)
             .map_err(|_| TableAccessError::InsertRowError("Cannot retrieve page iterator".to_string()))?;
 
-        let mut inserted = false;
         for mut page in page_iterator {
-            let row_data = row.serialize();
             if page.can_insert(&row_data) {
                 page.insert_record(row_data)?;
                 self.store.write_page(self.layout, &page, self.table)
                     .map_err(|_| TableAccessError::InsertRowError("Cannot write page".to_string()))?;
 
-                inserted = true;
-                break;
+                return Ok(());
             }
         }
 
-        if !inserted {
-            // No page with enough space found
-            let mut new_page = self.store.allocate_page(self.layout, self.table)
-                .map_err(|_| TableAccessError::InsertRowError("Cannot allocate page".to_string()))?;
+        // No page with enough space found, so allocate a new one:
+        let mut new_page = self.store.allocate_page(self.layout, self.table)
+            .map_err(|_| TableAccessError::InsertRowError("Cannot allocate page".to_string()))?;
 
-            let row_data = row.serialize();
-            new_page.insert_record(row_data)?;
+        new_page.insert_record(row_data)?;
 
-            self.store.write_page(self.layout, &new_page, self.table)
-                .map_err(|_| TableAccessError::InsertRowError("Cannot write new allocated page".to_string()))?;
-        }
+        self.store.write_page(self.layout, &new_page, self.table)
+            .map_err(|_| TableAccessError::InsertRowError("Cannot write new allocated page".to_string()))?;
 
         Ok(())
+    }
+
+    pub fn insert(&self, row: &Row) -> Result<(), TableAccessError> {
+        row.validate(self.table.schema())?;
+
+        self.raw_insert(row.serialize())
     }
 }
 
@@ -229,6 +296,145 @@ mod tests {
         database::access::TableAccess, store::{Store, file_store::FileStore}, 
         table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}
     };
+
+    #[test]
+    fn should_update_multiple_with_delete_reinsert() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "value", ColumnType::Varchar(7)),
+            Column::new(2, "someint", ColumnType::Int),
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(64).unwrap();
+        store.create(&layout, &table).unwrap();
+
+        let mut access = TableAccess::new(&table, &store, &layout);
+
+        let first = Row::new(vec![
+            Cell::Varchar("Rabbit".to_owned()),
+            Cell::Int(42),
+        ]);
+        let second = Row::new(vec![
+            Cell::Varchar("Rabbit".to_owned()),
+            Cell::Int(52),
+        ]);
+        let third = Row::new(vec![
+            Cell::Varchar("Rabbit".to_owned()),
+            Cell::Int(62),
+        ]);
+        let fourth = Row::new(vec![
+            Cell::Varchar("Hare".to_owned()),
+            Cell::Int(82),
+        ]);
+
+        access.insert(&first).unwrap();
+        access.insert(&second).unwrap();
+        access.insert(&third).unwrap();
+        access.insert(&fourth).unwrap();
+
+        // Act: UPDATE test SET value = "Bear" WHERE value = "Rabbit"
+        let result = access.find("value", Cell::Varchar("Rabbit".to_owned())).unwrap();
+
+        access.update(result, vec![("value", Cell::Varchar("Bear".to_owned()))]).unwrap();
+
+        // Assert: row with value "Rabbit" shouldn't exist anymore
+        let result = access.find("value", Cell::Varchar("Rabbit".to_owned())).unwrap();
+        let rows = result.rows();
+        assert_eq!(rows.len(), 0);
+
+        // Assert: row with value "Bear" exists instead
+        let result = access.find("value", Cell::Varchar("Bear".to_owned())).unwrap();
+        let rows = result.rows();
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn should_update_with_delete_reinsert() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "value", ColumnType::Varchar(7)),
+            Column::new(2, "someint", ColumnType::Int),
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(64).unwrap();
+        store.create(&layout, &table).unwrap();
+
+        let mut access = TableAccess::new(&table, &store, &layout);
+
+        let first_row = Row::new(vec![
+            Cell::Varchar("Rabbit".to_owned()),
+            Cell::Int(42),
+        ]);
+        let second_row = Row::new(vec![
+            Cell::Varchar("Hare".to_owned()),
+            Cell::Int(82),
+        ]);
+
+        access.insert(&first_row).unwrap();
+        access.insert(&second_row).unwrap();
+
+        // Act: UPDATE test SET value = "Bear" WHERE value = "Rabbit"
+        let result = access.find("value", Cell::Varchar("Rabbit".to_owned())).unwrap();
+        access.update(result, vec![("value", Cell::Varchar("Bear".to_owned()))]).unwrap();
+
+        // Assert: row with value "Rabbit" shouldn't exist anymore
+        let result = access.find("value", Cell::Varchar("Rabbit".to_owned())).unwrap();
+        let rows = result.rows();
+        assert_eq!(rows.len(), 0);
+
+        // Assert: row with value "Bear" exists instead
+        let result = access.find("value", Cell::Varchar("Bear".to_owned())).unwrap();
+        let rows = result.rows();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn should_update_in_place_rows() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "value", ColumnType::Int),
+            Column::new(2, "byte", ColumnType::Byte),
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        // Small page size, so we will have 2 pages (14 bytes header, 5 bytes row + 7 bytes slot size)
+        let layout = PageDataLayout::new(32).unwrap();
+        store.create(&layout, &table).unwrap();
+
+        let mut access = TableAccess::new(&table, &store, &layout);
+
+        let first_row = Row::new(vec![
+            Cell::Int(42),
+            Cell::Byte(1),
+        ]);
+        let second_row = Row::new(vec![
+            Cell::Int(82),
+            Cell::Byte(2),
+        ]);
+
+        access.insert(&first_row).unwrap();
+        access.insert(&second_row).unwrap();
+
+        // Act: UPDATE test SET value = 99 WHERE value = 82
+        let result = access.find("value", Cell::Int(82)).unwrap();
+        access.update(result, vec![("value", Cell::Int(99))]).unwrap();
+
+        // Assert: row with value 88 shouldn't exist anymore
+        let result = access.find("value", Cell::Int(82)).unwrap();
+        let rows = result.rows();
+        assert_eq!(rows.len(), 0);
+
+        // Assert: row with value 99 exists instead
+        let result = access.find("value", Cell::Int(99)).unwrap();
+        let rows = result.rows();
+        assert_eq!(rows.len(), 1);
+    }
 
 
     #[test]
@@ -256,9 +462,10 @@ mod tests {
         access.insert(&second_row).unwrap();
 
         let result = access.find_all().unwrap();
-        let rows = result.rows();
+        let rows = result.rows().into_iter().map(|(_, row)| row).collect::<Vec<Row>>();
         assert_eq!(rows.len(), 2);
-        // TODO: Test Cells
+        assert_eq!(rows[0].cells(), &[Cell::Varchar("Hans".to_owned())]);
+        assert_eq!(rows[1].cells(), &[Cell::Varchar("Rabbit".to_owned())]);
     }
 
     #[test]
