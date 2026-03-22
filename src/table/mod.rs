@@ -17,7 +17,7 @@ pub struct Column {
 }
 
 // needs Clone for now, because it is shared across QueryResult and this is the quickest solution
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableSchema {
     pub columns: Vec<Column>,
 }
@@ -44,6 +44,14 @@ impl Display for ColumnType {
 }
 
 impl ColumnType {
+    pub fn is_var_size(&self) -> bool {
+        match self {
+            ColumnType::Int => false,
+            ColumnType::Varchar(_) => true,
+            ColumnType::Byte => false,
+        }
+    }
+
     pub fn raw_type(&self) -> ColumnType {
         match self {
             ColumnType::Int => ColumnType::Int,

@@ -168,7 +168,7 @@ impl Cell {
                 bytes
             },
             Cell::Byte(b) => {
-                vec![b.clone()]
+                vec![*b]
             }
         }
     }
