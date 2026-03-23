@@ -18,6 +18,9 @@ pub enum TableAccessError {
     LoadRowsError(String),
     #[error("TableAccessError - update error: {0}")]
     UpdateRowsError(String),
+    #[error("TableAccessError - delete error: {0}")]
+    DeleteRowsError(String),
+
 }
 
 pub struct QueryResult<'db, I> {
@@ -186,6 +189,29 @@ impl<'db, S: Store> TableAccess<'db, S> {
         }))
     }
 
+    pub fn delete(&mut self, query_result: QueryResult<(Record, Row)>) -> Result<(), TableAccessError> {
+        let mut page_row_map = HashMap::new();
+
+        for (record, _) in query_result.rows() {
+            let delete_tuples = page_row_map.entry(*record.page_id()).or_insert(Vec::new());
+            delete_tuples.push(record);
+        }
+
+        for (page_id, records_to_delete) in page_row_map.iter() {
+            for record in records_to_delete.iter() {
+                let mut page = self.store.read_page(self.layout, *page_id, self.table)
+                .map_err(|e| TableAccessError::DeleteRowsError(e.to_string()))?;
+
+                page.delete_record(*record.record_index());
+
+                self.store.write_page(self.layout, &page, self.table)
+                    .map_err(|e| TableAccessError::DeleteRowsError(e.to_string()))?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn update(&mut self, query_result: QueryResult<(Record, Row)>, updates: Vec<(&str, Cell)>) -> Result<(), TableAccessError> {
         if query_result.schema != *self.table.schema() {
             return Err(TableAccessError::UpdateRowsError("QueryResult schema does not match table schema".to_string()));
@@ -219,7 +245,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
         // in place or delete and reinsert
         for (page_id, updated_rows) in updated_rows_map.into_iter() {
             let mut page = self.store.read_page(self.layout, page_id, self.table)
-            .map_err(|e| TableAccessError::UpdateRowsError(e.to_string()))?;
+                .map_err(|e| TableAccessError::UpdateRowsError(e.to_string()))?;
 
             if not_in_place_update {
                 // delete and reinsert
@@ -296,6 +322,55 @@ mod tests {
         database::access::TableAccess, store::{Store, file_store::FileStore}, 
         table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}
     };
+
+    #[test]
+    fn should_delete_multiple() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "value", ColumnType::Varchar(7)),
+            Column::new(2, "someint", ColumnType::Int),
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(64).unwrap();
+        store.create(&layout, &table).unwrap();
+
+        let mut access = TableAccess::new(&table, &store, &layout);
+
+        let first = Row::new(vec![
+            Cell::Varchar("Rabbit".to_owned()),
+            Cell::Int(42),
+        ]);
+        let second = Row::new(vec![
+            Cell::Varchar("Rabbit".to_owned()),
+            Cell::Int(52),
+        ]);
+        let third = Row::new(vec![
+            Cell::Varchar("Rabbit".to_owned()),
+            Cell::Int(62),
+        ]);
+        let fourth = Row::new(vec![
+            Cell::Varchar("Hare".to_owned()),
+            Cell::Int(82),
+        ]);
+
+        access.insert(&first).unwrap();
+        access.insert(&second).unwrap();
+        access.insert(&third).unwrap();
+        access.insert(&fourth).unwrap();
+
+        // Act: DELETE FROM test WHERE value = "Rabbit"
+        let result = access.find("value", Cell::Varchar("Rabbit".to_owned())).unwrap();
+
+        access.delete(result).unwrap();
+
+        // Assert: Only row with value = "Hare" should remain
+        let result = access.find_all().unwrap();
+        let rows = result.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.cells(), &[Cell::Varchar("Hare".to_owned()), Cell::Int(82)]);
+    }
 
     #[test]
     fn should_update_multiple_with_delete_reinsert() {
