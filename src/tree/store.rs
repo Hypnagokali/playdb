@@ -1,13 +1,17 @@
-use std::{cell::RefCell, fs::{self, File, OpenOptions}, io::{Read, Seek, Write}, path::Path, rc::Rc, time::Duration, u32};
+use std::{cell::RefCell, fs::{self, File, OpenOptions}, io::{Read, Seek, Write}, path::Path, rc::Rc, time::Duration};
 
 use thiserror::Error;
 use ttl_cache::TtlCache;
 
 use crate::tree::node::NodeOperationError;
 
-use super::{get_u32_be_bytes_from_option, node::NodePage, read_u32_with_null};
+use super::{get_u32_be_bytes_from_option, get_i32_be_bytes_from_option, read_u32_with_null, read_i32_with_null, node::NodePage};
 
 // File design:
+// NULL values are currently designed with sentinel values: u32::MAX and i32::MIN
+// This is not efficient and is only used for simplicity.
+// A better approach would be to use a bitmap to indicate which values are null and which are not. 
+// For example: for 16 possible values store 2 extra bytes to model null values in bits.
 
 // Metadata header => 14 Bytes
 // 2 bytes: max_degree
@@ -26,7 +30,7 @@ const POS_NEXT_DELETED_PAGE: usize = 5;
 // Node-Section:
 // 9 x 4 bytes: keys
 // 10 x 4 bytes: pageIds
-// 9 x 4 bytes: values
+// 9 x 8 bytes: values (tuples of i32, i32)
 const NEXT_LEAF_SIZE: usize = 4;
 // 4 bytes: next_leaf (linked list) u32:MAX for NULL
 
@@ -55,9 +59,13 @@ fn values_offset(max_degree: u16) -> usize {
     children_offset(max_degree) + children_array_size(max_degree)
 }
 
+fn values_array_size(max_degree: u16) -> usize {
+    ((max_degree - 1) * 8) as usize
+}
+
 fn next_leaf_offset(max_degree: u16) -> usize {
-    // size of children == size of keys
-    values_offset(max_degree) + key_array_size(max_degree)
+    // size of values is now 8 bytes per tuple (i32, i32)
+    values_offset(max_degree) + values_array_size(max_degree)
 }
 
 fn meta_data_to_bytes(store_meta_data: &StoreMetaData) -> Vec<u8> {
@@ -120,7 +128,7 @@ impl From<(Vec<u8>, u16)> for NodePage {
         let key_offset = key_offset();
         for k in 0..(max_degree - 1) {
             let next_offset = key_offset + (k as usize * 4);
-            let next_key = read_u32_with_null(u32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
+            let next_key = read_i32_with_null(i32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
             if let Some(next_key) = next_key {
                 keys.push(next_key);
             } else {
@@ -145,10 +153,14 @@ impl From<(Vec<u8>, u16)> for NodePage {
         
         let value_offset = values_offset(max_degree);
         for v in 0..(max_degree - 1) {
-            let next_offset = value_offset + (v as usize * 4);
-            let next_value = read_u32_with_null(u32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
-            if let Some(next_value) = next_value {
-                values.push(next_value);
+            let next_offset = value_offset + (v as usize * 8);
+            let val1_bytes: [u8; 4] = page_bytes[next_offset..(next_offset + 4)].try_into().unwrap();
+            let val2_bytes: [u8; 4] = page_bytes[(next_offset + 4)..(next_offset + 8)].try_into().unwrap();
+            let val1 = i32::from_be_bytes(val1_bytes);
+            let val2 = i32::from_be_bytes(val2_bytes);
+            // Only add if both values are not -1 (which represents NULL)
+            if val1 != -1 && val2 != -1 {
+                values.push((val1, val2));
             } else {
                 break;
             }
@@ -201,7 +213,7 @@ impl NodePager {
         let meta_data = self.meta_data.borrow();
         let children = (meta_data.max_degree * 4) as u32;
         let keys = ((meta_data.max_degree - 1) * 4) as u32;
-        let values = ((meta_data.max_degree - 1) * 4) as u32;
+        let values = ((meta_data.max_degree - 1) * 8) as u32; // tuples are 8 bytes each
 
         children + keys + values + NEXT_LEAF_SIZE as u32 + PAGE_HEADER_SIZE as u32
     }
@@ -244,8 +256,9 @@ impl NodePager {
 
         let values_offset = values_offset(meta_data.max_degree);
         for (i, v) in node.values().iter().enumerate() {
-            let current_offset = values_offset + (i * 4);
-            data[current_offset..(current_offset + 4)].copy_from_slice(&v.to_be_bytes());
+            let current_offset = values_offset + (i * 8);
+            data[current_offset..(current_offset + 4)].copy_from_slice(&v.0.to_be_bytes());
+            data[(current_offset + 4)..(current_offset + 8)].copy_from_slice(&v.1.to_be_bytes());
         }
 
         let next_leaf_offset = next_leaf_offset(meta_data.max_degree);
@@ -441,7 +454,7 @@ impl BTreeStore {
         }
     }
 
-    pub fn find_smaller_than(&self, key: u32, with_equal: bool) -> Result<Vec<u32>, BTreeStoreError> {
+    pub fn find_smaller_than(&self, key: i32, with_equal: bool) -> Result<Vec<(i32, i32)>, BTreeStoreError> {
         let mut result = Vec::new();
         let mut node = self.find_left_most_node()?;
         let target_node = self.find_node(key)?;
@@ -467,7 +480,7 @@ impl BTreeStore {
         Ok(result)
     }
 
-    pub fn find_greater_than(&self, key: u32, with_equal: bool) -> Result<Vec<u32>, BTreeStoreError> {
+    pub fn find_greater_than(&self, key: i32, with_equal: bool) -> Result<Vec<(i32, i32)>, BTreeStoreError> {
         let mut result = Vec::new();
         let mut node = self.find_node(key)?;
         
@@ -501,7 +514,7 @@ impl BTreeStore {
         }
     }
 
-    pub fn find_node(&self, key: u32) -> Result<Option<NodePage>, BTreeStoreError> {
+    pub fn find_node(&self, key: i32) -> Result<Option<NodePage>, BTreeStoreError> {
         let root = self.root()?;
 
         if let Some(page_id) = root.find_node(&self.pager, key)? {
@@ -511,13 +524,13 @@ impl BTreeStore {
         }
     }
 
-    pub fn find(&self, key: u32) -> Result<Option<u32>, BTreeStoreError> {
+    pub fn find(&self, key: i32) -> Result<Option<(i32, i32)>, BTreeStoreError> {
         let root = self.root()?;
 
         Ok(root.find_value(&self.pager, key)?)
     }
 
-    pub fn insert(&mut self, key: u32, value: u32) -> Result<(), BTreeStoreError> {
+    pub fn insert(&mut self, key: i32, value: (i32, i32)) -> Result<(), BTreeStoreError> {
         let mut root = self.root()?;
         if root.is_full() {
             let (rnode, root_key) = root.split(&self.pager)?;
@@ -545,7 +558,7 @@ impl BTreeStore {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: u32) -> Result<Option<u32>, BTreeStoreError> {
+    pub fn delete(&mut self, key: i32) -> Result<Option<(i32, i32)>, BTreeStoreError> {
         let mut root = self.root()?;
         let res = root.delete(&self.pager, key)?;
 
@@ -605,42 +618,46 @@ mod tests {
     fn find_left_most_node() {
         let temp = NamedTempFile::new().unwrap();
         let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
-        btree.insert(1, 1).unwrap();
-        btree.insert(10, 10).unwrap();
-        btree.insert(2, 2).unwrap();
-        btree.insert(5, 5).unwrap();      
-        btree.insert(100, 100).unwrap();
-        btree.insert(3, 3).unwrap();
-        btree.insert(4, 4).unwrap();
-        btree.insert(50, 50).unwrap();
-        btree.insert(20, 20).unwrap();
+        btree.insert(1, (1, 1)).unwrap();
+        btree.insert(10, (10, 10)).unwrap();
+        btree.insert(2, (2, 2)).unwrap();
+        btree.insert(5, (5, 5)).unwrap();      
+        btree.insert(100, (100, 100)).unwrap();
+        btree.insert(3, (3, 3)).unwrap();
+        btree.insert(4, (4, 4)).unwrap();
+        btree.insert(50, (50, 50)).unwrap();
+        btree.insert(20, (20, 20)).unwrap();
 
         let mut node = btree.find_left_most_node().unwrap().unwrap();
-        assert_eq!(node.keys(), &vec![1u32]);
+        assert_eq!(node.keys(), &vec![1i32]);
     }
 
     #[test]
     fn find_all_smaller_than() {
         let temp = NamedTempFile::new().unwrap();
         let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
-        btree.insert(1, 1).unwrap();
-        btree.insert(10, 10).unwrap();
-        btree.insert(2, 2).unwrap();
-        btree.insert(5, 5).unwrap();      
-        btree.insert(100, 100).unwrap();
-        btree.insert(3, 3).unwrap();
-        btree.insert(4, 4).unwrap();
-        btree.insert(50, 50).unwrap();
-        btree.insert(20, 20).unwrap();
-        btree.insert(6, 6).unwrap();
-        btree.insert(7, 7).unwrap();
-        btree.insert(8, 8).unwrap();
+        btree.insert(1, (1, 1)).unwrap();
+        btree.insert(10, (10, 10)).unwrap();
+        btree.insert(2, (2, 2)).unwrap();
+        btree.insert(5, (5, 5)).unwrap();      
+        btree.insert(100, (100, 100)).unwrap();
+        btree.insert(3, (3, 3)).unwrap();
+        btree.insert(4, (4, 4)).unwrap();
+        btree.insert(50, (50, 50)).unwrap();
+        btree.insert(20, (20, 20)).unwrap();
+        btree.insert(6, (6, 6)).unwrap();
+        btree.insert(7, (7, 7)).unwrap();
+        btree.insert(8, (8, 8)).unwrap();
 
         let mut result = btree.find_smaller_than(20, true).unwrap();
-        assert_eq!(result, vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 20]);
+        assert_eq!(result, 
+            vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (10, 10), (20, 20)]
+        );
 
         let mut result = btree.find_smaller_than(20, false).unwrap();
-        assert_eq!(result, vec![1, 2, 3, 4, 5, 6, 7, 8, 10]);
+        assert_eq!(result,
+            vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (10, 10)]
+        );
     }
 
 
@@ -649,35 +666,35 @@ mod tests {
     fn find_all_greater_than() {
         let temp = NamedTempFile::new().unwrap();
         let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
-        btree.insert(1, 1).unwrap();
-        btree.insert(10, 10).unwrap();
-        btree.insert(2, 2).unwrap();
-        btree.insert(5, 5).unwrap();      
-        btree.insert(100, 100).unwrap();
-        btree.insert(3, 3).unwrap();
-        btree.insert(4, 4).unwrap();
-        btree.insert(50, 50).unwrap();
-        btree.insert(20, 20).unwrap();
-        btree.insert(6, 6).unwrap();
-        btree.insert(7, 7).unwrap();
-        btree.insert(8, 8).unwrap();
+        btree.insert(1, (1, 1)).unwrap();
+        btree.insert(10, (10, 10)).unwrap();
+        btree.insert(2, (2, 2)).unwrap();
+        btree.insert(5, (5, 5)).unwrap();      
+        btree.insert(100, (100, 100)).unwrap();
+        btree.insert(3, (3, 3)).unwrap();
+        btree.insert(4, (4, 4)).unwrap();
+        btree.insert(50, (50, 50)).unwrap();
+        btree.insert(20, (20, 20)).unwrap();
+        btree.insert(6, (6, 6)).unwrap();
+        btree.insert(7, (7, 7)).unwrap();
+        btree.insert(8, (8, 8)).unwrap();
 
         let mut result = btree.find_greater_than(7, true).unwrap();
-        assert_eq!(result, vec![7, 8, 10, 20, 50, 100]);
+        assert_eq!(result, vec![(7, 7), (8, 8), (10, 10), (20, 20), (50, 50), (100, 100)]);
 
         let mut result = btree.find_greater_than(7, false).unwrap();
-        assert_eq!(result, vec![8, 10, 20, 50, 100]);
+        assert_eq!(result, vec![(8, 8), (10, 10), (20, 20), (50, 50), (100, 100)]);
     }
 
     #[test]
     fn delete_everything_except_one_key() {
         let temp = NamedTempFile::new().unwrap();
         let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
-        btree.insert(1, 1).unwrap();
-        btree.insert(10, 10).unwrap();
-        btree.insert(2, 2).unwrap();
-        btree.insert(5, 5).unwrap();
-        btree.insert(100, 100).unwrap();
+        btree.insert(1, (1, 1)).unwrap();
+        btree.insert(10, (10, 10)).unwrap();
+        btree.insert(2, (2, 2)).unwrap();
+        btree.insert(5, (5, 5)).unwrap();
+        btree.insert(100, (100, 100)).unwrap();
 
         btree.delete(1).unwrap();
         btree.delete(10).unwrap();
@@ -687,7 +704,7 @@ mod tests {
         let row_page = btree.find(100).unwrap();
 
         assert!(row_page.is_some());
-        assert_eq!(row_page.unwrap(), 100);
+        assert_eq!(row_page.unwrap(), (100, 100));
 
         let row_page = btree.find(5).unwrap();
         assert!(row_page.is_none());
@@ -701,21 +718,21 @@ mod tests {
     fn insert_delete_find() {
         let temp = NamedTempFile::new().unwrap();
         let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
-        btree.insert(1, 1).unwrap();
-        btree.insert(10, 10).unwrap();
-        btree.insert(2, 2).unwrap();
-        btree.insert(5, 5).unwrap();
-        btree.insert(100, 100).unwrap();
+        btree.insert(1, (1, 1)).unwrap();
+        btree.insert(10, (10, 10)).unwrap();
+        btree.insert(2, (2, 2)).unwrap();
+        btree.insert(5, (5, 5)).unwrap();
+        btree.insert(100, (100, 100)).unwrap();
 
         let row_page = btree.find(2).unwrap();
 
         assert!(row_page.is_some());
-        assert_eq!(row_page.unwrap(), 2);
+        assert_eq!(row_page.unwrap(), (2, 2));
 
         // delete key=2 => merge happens: lend key 5 from right node before delete
         let deleted_value = btree.delete(2).unwrap();
         assert!(deleted_value.is_some());
-        assert_eq!(deleted_value.unwrap(), 2);
+        assert_eq!(deleted_value.unwrap(), (2, 2));
 
         // try to delete key=2 again will merge the middle with the right node again
         let deleted_value = btree.delete(2).unwrap();
@@ -725,44 +742,44 @@ mod tests {
         let row_page = btree.find(5).unwrap();
 
         assert!(row_page.is_some());
-        assert_eq!(row_page.unwrap(), 5);
+        assert_eq!(row_page.unwrap(), (5, 5));
 
         // Try to find a value in the right most node after parents key has been updated:
         let row_page = btree.find(100).unwrap();
 
         assert!(row_page.is_some());
-        assert_eq!(row_page.unwrap(), 100);
+        assert_eq!(row_page.unwrap(), (100, 100));
     }
 
     #[test]
     fn insert_and_find() {
         let temp = NamedTempFile::new().unwrap();
         let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
-        btree.insert(1, 1).unwrap();
-        btree.insert(10, 10).unwrap();
-        btree.insert(2, 2).unwrap();
-        btree.insert(5, 5).unwrap();
-        btree.insert(100, 100).unwrap();
-        btree.insert(3, 3).unwrap();
-        btree.insert(4, 4).unwrap();
+        btree.insert(1, (1, 1)).unwrap();
+        btree.insert(10, (10, 10)).unwrap();
+        btree.insert(2, (2, 2)).unwrap();
+        btree.insert(5, (5, 5)).unwrap();
+        btree.insert(100, (100, 100)).unwrap();
+        btree.insert(3, (3, 3)).unwrap();
+        btree.insert(4, (4, 4)).unwrap();
 
         let row_page = btree.find(100).unwrap();
 
         assert!(row_page.is_some());
-        assert_eq!(row_page.unwrap(), 100);
+        assert_eq!(row_page.unwrap(), (100, 100));
     }
 
     #[test]
     fn insert_and_find_in_root_only() {
         let temp = NamedTempFile::new().unwrap();
         let mut btree= BTreeStore::new(temp.path(), 4).unwrap();
-        btree.insert(1, 1).unwrap();
-        btree.insert(10, 10).unwrap();
+        btree.insert(1, (1, 1)).unwrap();
+        btree.insert(10, (10, 10)).unwrap();
 
         let row_page = btree.find(1).unwrap();
 
         assert!(row_page.is_some());
-        assert_eq!(row_page.unwrap(), 1);
+        assert_eq!(row_page.unwrap(), (1, 1));
     }
 
 
@@ -848,7 +865,7 @@ mod tests {
         let page2 = NodePage::new_from_store(
             1, false, 
             None, vec![7, 8],
-            Vec::new(), vec![1, 2],
+            Vec::new(), vec![(1, 2), (3, 4)],
             None, 4
         );
         *page2.changed().borrow_mut() = true;
@@ -859,7 +876,7 @@ mod tests {
         assert_eq!(*page2_loaded.deleted(), false);
         assert_eq!(*page2_loaded.next_deleted_page(), None);
         assert_eq!(*page2_loaded.keys(), vec![7, 8]);
-        assert_eq!(*page2_loaded.values(), vec![1, 2]);
+        assert_eq!(*page2_loaded.values(), vec![(1, 2), (3, 4)]);
     }
 
     #[test]
@@ -871,7 +888,7 @@ mod tests {
         assert!(btree.is_err());
         let btree = BTreeStore::new(temp.path(), 4);
         assert!(btree.is_ok());
-        assert_eq!(btree.unwrap().page_size(), 53) // 9 + 4*4 + 3*4 + 3*4 + 4 = 53
+        assert_eq!(btree.unwrap().page_size(), 65) // 9 + 4*4 + 3*4 + 3*8 + 4 = 65
     }
 
     #[test]
@@ -889,7 +906,7 @@ mod tests {
         assert_eq!(meta_data.first_deleted_page, None);
         assert_eq!(meta_data.max_degree, 10); // Use the degree from meta data section
         assert_eq!(meta_data.number_of_pages, 0);
-        assert_eq!(btree.page_size(), 125) // 9 + 10*4 + 9*4 + 9*4 + 4 = 125
+        assert_eq!(btree.page_size(), 161) // 9 + 10*4 + 9*4 + 9*8 + 4 = 161
     }
 
 }

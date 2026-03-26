@@ -4,7 +4,7 @@
 //! Usually, a node would be split by page size, not by number of keys, 
 //! because a key may have a variable size (strings, composites).
 //! See (2026-03-16): https://github.com/postgres/postgres/blob/master/src/backend/access/nbtree/README#L160
-use std::{cell::RefCell, mem, rc::Rc, u32};
+use std::{cell::RefCell, mem, rc::Rc};
 
 use derive_getters::Getters;
 use thiserror::Error;
@@ -43,12 +43,12 @@ impl From<NodePagerError> for NodeOperationError {
 // So I've put it off for now :)
 #[derive(Debug, Getters, Clone)]
 pub struct NodePage {
-    id: u32, // u32::MAX is a new page
+    id: u32,
     deleted: bool,
     next_deleted_page: Option<u32>,
-    keys: Vec<u32>,
+    keys: Vec<i32>,
     children: Vec<u32>, // stores page number (page_id)
-    values: Vec<u32>, // each item points to a page of rows
+    values: Vec<(i32, i32)>, // each item is a tuple of (page_id, slot)
     next_leaf: Option<u32>, // Linked list to next leaf-node (if leaf) 
     max_degree: usize,
     changed: Rc<RefCell<bool>>, // flag is not stored, indicates, if the node has been changed
@@ -56,7 +56,7 @@ pub struct NodePage {
 }
 
 impl NodePage {
-    pub fn keys_mut(&mut self) -> &mut Vec<u32> {
+    pub fn keys_mut(&mut self) -> &mut Vec<i32> {
         *self.changed.borrow_mut() = true;
         &mut self.keys
     }
@@ -66,7 +66,7 @@ impl NodePage {
         &mut self.children
     }
 
-    pub fn values_mut(&mut self) -> &mut Vec<u32> {
+    pub fn values_mut(&mut self) -> &mut Vec<(i32, i32)> {
         *self.changed.borrow_mut() = true;
         &mut self.values
     }
@@ -109,9 +109,9 @@ impl NodePage {
         id: u32,
         deleted: bool,
         next_deleted_page: Option<u32>,
-        keys: Vec<u32>,
+        keys: Vec<i32>,
         children: Vec<u32>,
-        values: Vec<u32>,
+        values: Vec<(i32, i32)>,
         next_leaf: Option<u32>,
         max_degree: usize
     ) -> Self {
@@ -231,7 +231,7 @@ impl NodePage {
 
     // returns new allocated right node and the key (K) for the parent
     // self is the left node
-    pub fn split(&mut self, pager: &NodePager) -> Result<(NodePage, u32), NodeOperationError> {
+    pub fn split(&mut self, pager: &NodePager) -> Result<(NodePage, i32), NodeOperationError> {
         // check invariants before split
         let middle_value_index = self.keys.len() / 2;
 
@@ -271,7 +271,7 @@ impl NodePage {
         Ok((right_node, promoted_key))
     }
 
-    fn find_key_index(&self, key: u32) -> FindKeyResponse {
+    fn find_key_index(&self, key: i32) -> FindKeyResponse {
         for (i, &k) in self.keys.iter().enumerate() {
             if key < k {
                 return FindKeyResponse::LessThan(i);
@@ -292,7 +292,7 @@ impl NodePage {
         }
     }
 
-    fn insert_key_value(&mut self, key: u32, value: u32) -> Result<(), NodeOperationError> {
+    fn insert_key_value(&mut self, key: i32, value: (i32, i32)) -> Result<(), NodeOperationError> {
         match self.find_key_index(key) {
             FindKeyResponse::LessThan(i) => {
                 self.keys.insert(i, key);
@@ -312,7 +312,7 @@ impl NodePage {
         }
     }
     
-    pub fn insert(&mut self, pager: &NodePager, key: u32, value: u32, unique: bool) -> Result<(), NodeOperationError>{
+    pub fn insert(&mut self, pager: &NodePager, key: i32, value: (i32, i32), unique: bool) -> Result<(), NodeOperationError>{
         if !unique {
             panic!("Duplicate keys are not handled yet. Unique must always be true.");
         }
@@ -397,7 +397,7 @@ impl NodePage {
         }
     }
 
-    pub fn find_node(&self, pager: &NodePager, key: u32) -> Result<Option<u32>, NodeOperationError> {
+    pub fn find_node(&self, pager: &NodePager, key: i32) -> Result<Option<u32>, NodeOperationError> {
         match self.find_key_index(key) {
             // is leaf
             FindKeyResponse::GreaterThanTheLast(_) if self.is_leaf() => Ok(None),
@@ -416,7 +416,7 @@ impl NodePage {
         }
     }
 
-    pub fn find_value(&self, pager: &NodePager, key: u32) -> Result<Option<u32>, NodeOperationError> {
+    pub fn find_value(&self, pager: &NodePager, key: i32) -> Result<Option<(i32, i32)>, NodeOperationError> {
         if let Some(node) = self.find_node(pager, key)? {
             let page = pager.read_page(node)?;
             for (i, k) in page.keys().iter().enumerate() {
@@ -431,7 +431,7 @@ impl NodePage {
     }
 
     // Delete a key from this subtree. Returns the removed value if present.
-    pub fn delete(&mut self, pager: &NodePager, key: u32) -> Result<Option<u32>, NodeOperationError> {
+    pub fn delete(&mut self, pager: &NodePager, key: i32) -> Result<Option<(i32, i32)>, NodeOperationError> {
         if self.is_leaf() {
             // TODO: use binary search
             if let Some(pos) = self.keys.iter().position(|k| *k == key) {
