@@ -32,6 +32,10 @@ impl<'db, I> QueryResult<'db, I> {
     pub fn rows(self) -> Vec<I> {
         self.row_iter.into_iter().collect()
     }
+
+    pub fn schema(&self) -> &TableSchema {
+        &self.schema
+    }
 }
 
 impl<'db> QueryResult<'db, (Record, Row)> {
@@ -319,7 +323,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{data::page::PageDataLayout, 
-        database::access::TableAccess, store::{Store, file_store::FileStore}, 
+        database::table_access::TableAccess, store::{Store, file_store::FileStore}, 
         table::{Column, ColumnType, TableSchema, table::{Cell, Row, Table}}
     };
 

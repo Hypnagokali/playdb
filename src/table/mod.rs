@@ -5,9 +5,9 @@ pub mod table;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum ColumnType { // Byte type
-    Int,            // 0x01
-    Varchar(u16),   // 0x02 length is stored separately
-    Byte,           // 0x03
+    Int,            // 0x00
+    Varchar(u16),   // 0x01 length is stored separately
+    Byte,           // 0x02
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
@@ -30,6 +30,10 @@ impl TableSchema {
         Self {
             columns,
         }
+    }
+
+    pub fn find_index_of(&self, column_name: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c.name == column_name)
     }
 }
 
