@@ -9,11 +9,12 @@ pub enum Cell {
     Byte(u8),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Row {
     cells: Vec<Cell>,
 }
 
+#[derive(Debug)]
 pub struct Table {
     id: i32,
     name: String,
@@ -25,8 +26,8 @@ pub struct Table {
 pub enum RowValidationError {
     #[error("Row length does not match schema")]
     LengthMismatch,
-    #[error("Type mismatch for column '{0}'")]
-    TypeMismatch(String),
+    #[error("Type mismatch for column '{0}'. Expected: {1}, got {2}")]
+    TypeMismatch(String, String, String),
     #[error("Varchar length exceeds maximum of {0} for column '{1}'")]
     VarcharTooLong(u16, String),
 }
@@ -83,7 +84,13 @@ impl Row {
                     // always valid
                 }
                 _ => {
-                    return Err(RowValidationError::TypeMismatch(column.name.clone()));
+                    return Err(
+                        RowValidationError::TypeMismatch(
+                            column.name.clone(),
+                            column.col_type.to_string(),
+                            cell.column_type().to_string()
+                        )
+                    );
                 }
             }
         }
@@ -350,7 +357,7 @@ mod tests {
         let result = table.validate_row(&invalid_row);
         assert!(result.is_err());
         
-        matches!(result.unwrap_err(), RowValidationError::TypeMismatch(name) if name == "name");
+        matches!(result.unwrap_err(), RowValidationError::TypeMismatch(name, _, _) if name == "name");
     }
 
     #[test]

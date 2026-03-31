@@ -5,9 +5,15 @@ use thiserror::Error;
 use crate::{data::page::{Page, PageDataLayout, PageFileMetadata, Record, RecordIterator}, table::{TableSchema, table::{Row, Table}}};
 
 // Store is always owned by a Database instance
+// ToDo: this trait could be much smaller:
+//  - Metadata stored in the system catalogs not as separate part
+//  - Page allocation should not be exposed
+//  - PageIterator could be a method of a different trait
+//  - Table lifecycle should be separated from page management
 pub trait Store {
     // fn store_layout(&self, layout: &PageDataLayout, database: &Database);
     // fn load_layout(&self, database: &Database) -> PageDataLayout;
+    fn delete_all(&self) -> Result<(), StoreError>;
     fn create(&self, layout: &PageDataLayout, table: &Table) -> Result<(), StoreError>;
     fn delete(&self, table: &Table) -> Result<(), StoreError>;
     fn read_metadata(&self, layout: &PageDataLayout, table: &Table) -> Result<PageFileMetadata, StoreError>;

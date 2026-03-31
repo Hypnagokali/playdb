@@ -21,7 +21,7 @@ impl<'a> FileStore<'a> {
     }
 
     fn delete_file(&self, table: &Table) -> Result<(), StoreError> {
-        remove_file(Path::new(&table.file_path()))
+        remove_file(self.file_path(&table))
             .map_err(|e| StoreError::IoError(e.to_string()))?;
 
         Ok(())
@@ -33,6 +33,9 @@ impl<'a> FileStore<'a> {
     }
 
     fn write_metadata(&self, layout: &PageDataLayout, metadata: &PageFileMetadata, table: &Table) -> Result<(), StoreError> {
+        if std::fs::exists(table.file_path())? {
+            return Err(StoreError::IoError(format!("Data structure '{}' already exists", table.file_path())));
+        }
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -44,6 +47,19 @@ impl<'a> FileStore<'a> {
     }
 }
 impl<'a> Store for FileStore<'a> {
+    fn delete_all(&self) -> Result<(), StoreError> {
+        for entry in std::fs::read_dir(self.base_path)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !path.is_dir() {
+                println!("Deleting file: {:?}", path);
+                // std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+
     fn read_metadata(&self, layout: &PageDataLayout, table: &Table) -> Result<PageFileMetadata, StoreError> {
         let path: PathBuf = self.file_path(table);
         if !path.exists() {
