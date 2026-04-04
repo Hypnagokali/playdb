@@ -40,7 +40,7 @@ impl<'db, S: Store> SeqAccess<'db, S> {
     }
 
     pub fn next_val(&mut self, column: &str) -> Result<i32, SeqAccessError> {
-        let col_id = self.table.schema().find_index_of(column)
+        let col_id = self.table.schema().find_index_by_name(column)
             .ok_or(SeqAccessError::ColumnNotFound(column.to_owned()))
             .and_then(|col_idx| {
                 let col_id_cell = &self.table.schema().columns[col_idx];
@@ -51,7 +51,7 @@ impl<'db, S: Store> SeqAccess<'db, S> {
             })?;
 
         let seq_query = self.sequence_acc.find("col_id", Cell::Int(col_id))?;
-        let current_idx = seq_query.schema().find_index_of("current")
+        let current_idx = seq_query.schema().find_index_by_name("current")
             .ok_or(SeqAccessError::NotASequence)?;
 
         let seq = seq_query.rows();

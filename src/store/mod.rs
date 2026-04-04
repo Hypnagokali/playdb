@@ -2,17 +2,19 @@ pub mod file_store;
 
 use thiserror::Error;
 
-use crate::{data::page::{Page, PageDataLayout, PageFileMetadata, Record, RecordIterator}, table::{TableSchema, table::{Row, Table}}};
+use crate::{data::page::{Page, PageDataLayout, PageFileMetadata, Record, RecordIterator}, table::{TableSchema, table::{Row, Table}}, tree::store::{BTreeStore, BTreeStoreError}};
 
 // Store is always owned by a Database instance
-// ToDo: this trait could be much smaller:
-//  - Metadata stored in the system catalogs not as separate part
-//  - Page allocation should not be exposed
-//  - PageIterator could be a method of a different trait
-//  - Table lifecycle should be separated from page management
+// ToDo:
+//  - Get rid of the extra PageFileMetadata 
+//    (number_of_pages could go into the catalog table and page_id is just the physical location in the file)
+//  - Table lifecycle should be separated from page management (create, delete)
+//  - Separate different concerns: raw physical layer, table related stuff (reading btree)
+//  - of course, the methods should not depend on Table, because theoretically the store can store everything
 pub trait Store {
-    // fn store_layout(&self, layout: &PageDataLayout, database: &Database);
-    // fn load_layout(&self, database: &Database) -> PageDataLayout;
+    // This method is just a very quick solution. If the Store will still provide access to the BTree in future,
+    // the BTree output must be a trait to provide different implementations. BTreeStore is only file based at the moment.
+    fn read_btree(&self, btree_id: i32) -> Result<BTreeStore, StoreError>;
     fn delete_all(&self) -> Result<(), StoreError>;
     fn create(&self, layout: &PageDataLayout, table: &Table) -> Result<(), StoreError>;
     fn delete(&self, table: &Table) -> Result<(), StoreError>;
@@ -20,11 +22,52 @@ pub trait Store {
     fn read_page<'db>(&self, layout: &'db PageDataLayout, page_id: i32, table: &Table) -> Result<Page<'db>, StoreError>;
     fn write_page(&self, layout: &PageDataLayout, page: &Page, table: &Table) -> Result<(), StoreError>;
     fn allocate_page<'db>(&self, layout: &'db PageDataLayout, table: &Table) -> Result<Page<'db>, StoreError>;
-    fn page_iterator<'database>(&'database self, layout: &'database PageDataLayout, table: &'database crate::table::table::Table) -> Result<PageIterator<'database, Self>, StoreError> 
+    fn seq_page_iterator<'database>(&'database self, layout: &'database PageDataLayout, table: &'database crate::table::table::Table) -> Result<PageIterator<'database, Self>, StoreError> 
     where
         Self: Sized
     {
         Ok(PageIterator::new(table, self, layout))
+    }
+}
+
+pub struct IndexedRowIterator<'db, S: Store> {
+    layout: &'db PageDataLayout,
+    store: &'db S,
+    table: &'db Table,
+    indexes: Vec<(i32, i32)>, // page_id, slot_id
+    current_index: usize,
+}
+
+impl<'db, S: Store> IndexedRowIterator<'db, S> {
+    pub fn new(table: &'db Table, store: &'db S, layout: &'db PageDataLayout, indexes: Vec<(i32, i32)>) -> Self {
+        Self {
+            table,
+            layout,
+            store,
+            indexes,
+            current_index: 0,
+        }
+    }
+}
+
+impl<'db, S: Store> Iterator for IndexedRowIterator<'db, S> {
+    type Item = Row;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut row = None;
+
+        while row.is_none() && self.current_index < self.indexes.len() {
+            // find next record, which is not deleted
+            let (page_id, slot_id) = &self.indexes[self.current_index];
+            let page = self.store.read_page(self.layout, *page_id, self.table).unwrap();
+
+            row = page.read_slot(*slot_id as usize)
+                .map(|data| Row::deserialize(data, self.table.schema()));
+
+            self.current_index += 1;
+        }
+
+        row
     }
 }
 
@@ -99,10 +142,18 @@ pub enum StoreError {
     IoError(String),
     #[error("StoreError - Deserialization Error: {0}")]
     DeserializationError(String),
+    #[error("StoreError - Cannot read BTreeStore: {0}")]
+    ReadBTreeStoreError(String),
 }
 
 impl From<std::io::Error> for StoreError {
     fn from(err: std::io::Error) -> Self {
         StoreError::IoError(err.to_string())
+    }
+}
+
+impl From<BTreeStoreError> for StoreError {
+    fn from(err: BTreeStoreError) -> Self {
+        StoreError::ReadBTreeStoreError(err.to_string())
     }
 }

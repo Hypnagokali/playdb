@@ -4,7 +4,7 @@ use thiserror::Error;
 
 #[derive(Debug)]
 pub struct PageDataLayout {
-    page_size: usize,
+    page_size: u16,
 }
 
 #[derive(Error, Debug)]
@@ -23,8 +23,8 @@ impl PageDataLayout {
     // table meta data: 4 bytes next_id, 4 bytes number_of_pages
     pub const META_DATA_SIZE: usize = 8;
     // page header: 2 bytes num_rows, 4 bytes data_offset, 4 bytes page_id, 4 bytes slots_offset
-    const PAGE_HEADER_SIZE: usize = 14;
-    const MIN_PAGE_SIZE: usize = 32; // just arbitrarily chosen value > 10 and good to test :)
+    const PAGE_HEADER_SIZE: u16 = 14;
+    const MIN_PAGE_SIZE: u16 = 32; // just arbitrarily value so it's easy to test with few bytes
 
 
     // free data tuple constants
@@ -34,7 +34,7 @@ impl PageDataLayout {
     const SLOT_RECORD_LENGTH_INDEX: usize = 5;
     const MAX_ROW_LENGTH: u16 = u16::MAX;
 
-    pub fn new(page_size: usize) -> Result<Self, PageDataLayoutError> {
+    pub fn new(page_size: u16) -> Result<Self, PageDataLayoutError> {
         if page_size < Self::MIN_PAGE_SIZE {
             return Err(PageDataLayoutError::InvalidPageSize);
         }
@@ -43,11 +43,11 @@ impl PageDataLayout {
     }
 
     pub fn page_size(&self) -> usize {
-        self.page_size
+        self.page_size as usize
     }
 
     pub fn page_data_size(&self) -> usize {
-        self.page_size - Self::PAGE_HEADER_SIZE
+        (self.page_size - Self::PAGE_HEADER_SIZE) as usize
     }
 
     pub fn metadata_size(&self) -> usize {
@@ -280,6 +280,14 @@ impl<'database> Page<'database> {
         self.page_id = page_id;
     }
 
+    pub fn read_slot(&self, slot_id: usize) -> Option<&[u8]> {
+        self.slots.get(slot_id)
+            .filter(|slot| !slot.deleted)
+            .map(|slot| {
+                self.read_data(slot)
+            })
+    }
+
     fn max_fragmented_free_space(&self) -> usize {
         self.slots.iter()
             .filter(|s| s.deleted)
@@ -357,13 +365,14 @@ impl<'database> Page<'database> {
         }
     }
 
-    pub fn insert_record(&mut self, row_bytes: Vec<u8>) -> Result<(), PageError> {
+    /// Inserts the record into the page and returns the slot index of the inserted record
+    pub fn insert_record(&mut self, row_bytes: Vec<u8>) -> Result<usize, PageError> {
         if !self.can_insert(&row_bytes) {
             return Err(PageError::InsertRowError);
         }
 
         let new_record_len = row_bytes.len() as u16; // size already checked
-
+        let slot_index;
         // It's quite expensive and messy to insert directly into deleted slots
         // better: use page compaction regularly and put the dead tuples into the free space area
         // How this could work:
@@ -371,10 +380,14 @@ impl<'database> Page<'database> {
         // - don't delete the deleted slot pointer (because that would break the index)
         // - only reuse slot pointers after the index is not using them anymore (do index cleanup regularly)
         let deleted_slot = self.find_free_slot_index(&row_bytes)
-            .and_then(|slot_index| self.slots.get_mut(slot_index));
+            .and_then(|slot_index| {
+                self.slots.get_mut(slot_index)
+                    .map(|slot| (slot_index, slot))
+        });
 
 
-        let (slot_deleted, new_slot_len, slot_data_start_offset) = if let Some(slot) = deleted_slot {
+        let (slot_deleted, new_slot_len, slot_data_start_offset) = if let Some((index, slot)) = deleted_slot {
+            slot_index = index;
             let end_of_data = slot.page_offset + row_bytes.len();
             self.data[slot.page_offset..end_of_data].copy_from_slice(&row_bytes);
 
@@ -389,6 +402,9 @@ impl<'database> Page<'database> {
 
             (true, remaining_slot_len, end_of_data)
         } else {
+            // just returning the length of slots should be correct
+            // because a new slot must be allocated for this data
+            slot_index = self.slots.len();
             let start_of_data = self.data_offset - row_bytes.len();
             self.data[start_of_data..self.data_offset].copy_from_slice(&row_bytes);
             self.data_offset -= row_bytes.len();
@@ -402,7 +418,7 @@ impl<'database> Page<'database> {
     
         self.number_of_records += 1;
 
-        Ok(())
+        Ok(slot_index)
     }
 
     fn allocate_slot(&mut self, page_offset: usize, record_length: u16, deleted: bool) {

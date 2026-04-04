@@ -372,11 +372,11 @@ impl BTreeStore {
             return Err(BTreeStoreError { msg: "BTreeStore must have at least a max degree of 4".to_owned() });
         }
 
-        // check if file already exists
         let store_meta_data;
-        let file_meta_data = fs::metadata(file_path)
-            .map_err(|err| BTreeStoreError { msg: err.to_string() })?;
-        let file_size = file_meta_data.len();
+
+        let file_size = fs::metadata(file_path).ok()
+            .map(|fmd| fmd.len())
+            .unwrap_or(0);
 
         let file = match OpenOptions::new().read(true).write(true).open(file_path) {
             Ok(mut f) if file_size >= META_DATA_HEADER_SIZE as u64 => {

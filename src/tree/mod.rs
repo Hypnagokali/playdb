@@ -1,8 +1,13 @@
-// Copied from from my algos_test repo
 use std::u32;
 
 pub mod store;
 mod node;
+
+
+// Refactoring:
+// at least a BTree trait is needed, so that the BTree is independent of the physical storage and implementation.
+// The store::Store trait could then provide an associative type for the BTree output.
+// The FileStore would then return the FileBTreeStore.
 
 pub fn read_u32_with_null(raw_value: u32) -> Option<u32> {
     if raw_value == u32::MAX {
