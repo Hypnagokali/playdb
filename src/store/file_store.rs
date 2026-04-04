@@ -1,6 +1,9 @@
 use std::{fs::remove_file, io::{Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
 
-use crate::{data::page::{Page, PageDataLayout, PageFileMetadata}, store::{Store, StoreError}, table::table::Table};
+use crate::{data::page::{Page, PageDataLayout, PageFileMetadata}, store::{Store, StoreError}, table::table::Table, tree::store::BTreeStore};
+
+// Defines how many keys fit into one node
+const BTREE_MAX_DEGREE: u16 = 500;
 
 pub struct FileStore<'a> {
     base_path: &'a Path,
@@ -33,13 +36,9 @@ impl<'a> FileStore<'a> {
     }
 
     fn write_metadata(&self, layout: &PageDataLayout, metadata: &PageFileMetadata, table: &Table) -> Result<(), StoreError> {
-        if std::fs::exists(table.file_path())? {
-            return Err(StoreError::IoError(format!("Data structure '{}' already exists", table.file_path())));
-        }
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .open(self.base_path.join(table.file_path()))?;
+            .open(self.file_path(&table))?;
 
         file.write_all(&metadata.serialize(layout))?;
 
@@ -113,7 +112,7 @@ impl<'a> Store for FileStore<'a> {
         let mut metadata = self.read_metadata(layout, table)?;
         let mut new_page = Page::new(layout);
         new_page.set_page_id(metadata.allocate_next_page_id());
-
+        
         // ToDo: here we can get into an inconsistent state if write_page fails after write_metadata succeeded
         self.write_metadata(layout, &metadata, table)?;
         self.write_page(layout, &new_page, table)?;
@@ -121,11 +120,21 @@ impl<'a> Store for FileStore<'a> {
     }
     
     fn create(&self, layout: &PageDataLayout, table: &Table) -> Result<(), StoreError> {
+        if std::fs::exists(self.file_path(&table))? {
+            return Err(StoreError::IoError(format!("Data structure '{}' already exists", table.file_path())));
+        }
+        std::fs::File::create(self.file_path(&table))?;
         self.init(layout, table)
     }
     
     fn delete(&self, table: &Table) -> Result<(), StoreError> {
         self.delete_file(table)
+    }
+    
+    fn read_btree(&self, btree_id: i32) -> Result<BTreeStore, StoreError> {
+        let index_file = format!("btreeindex_{}.dat", btree_id);
+        let full_path = self.base_path.join(index_file);
+        Ok(BTreeStore::new(&full_path, BTREE_MAX_DEGREE)?)
     }
 }
 

@@ -141,7 +141,20 @@ pub enum CellDeserializationError {
     InvalidData,
 }
 
+#[derive(Debug, Error)]
+pub enum CellError {
+    #[error("The cell is not an Int. Msg: {0}")]
+    ExpectedInt(String),
+}
+
 impl Cell {
+    pub fn expect_int(&self, error_msg: &str) -> Result<i32, CellError> {
+        match self {
+            Cell::Int(v) => Ok(*v),
+            _ => Err(CellError::ExpectedInt(error_msg.to_owned())),
+        }
+    }
+
     pub fn column_type(&self) -> ColumnType {
         match self {
             Cell::Int(_) => ColumnType::Int,

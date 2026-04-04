@@ -32,7 +32,11 @@ impl TableSchema {
         }
     }
 
-    pub fn find_index_of(&self, column_name: &str) -> Option<usize> {
+    pub fn find_index_by_id(&self, column_id: &i32) -> Option<usize> {
+        self.columns.iter().position(|c| &c.id == column_id)
+    }
+
+    pub fn find_index_by_name(&self, column_name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name == column_name)
     }
 }
