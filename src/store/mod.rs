@@ -1,5 +1,7 @@
 pub mod file_store;
 
+use std::collections::HashMap;
+
 use thiserror::Error;
 
 use crate::{data::page::{Page, PageDataLayout, PageFileMetadata, Record, RecordIterator}, table::{TableSchema, table::{Row, Table}}, tree::store::{BTreeStore, BTreeStoreError}};
@@ -34,40 +36,66 @@ pub struct IndexedRowIterator<'db, S: Store> {
     layout: &'db PageDataLayout,
     store: &'db S,
     table: &'db Table,
-    indexes: Vec<(i32, i32)>, // page_id, slot_id
+    indexes: Vec<(i32, Vec<usize>)>, // page_id => Vec<slot_id>
+    record_iter: Option<RecordIterator>,
     current_index: usize,
 }
 
 impl<'db, S: Store> IndexedRowIterator<'db, S> {
     pub fn new(table: &'db Table, store: &'db S, layout: &'db PageDataLayout, indexes: Vec<(i32, i32)>) -> Self {
+        let mut map: HashMap<i32, Vec<usize>> = HashMap::new();
+
+        for (page_id, slot_id) in indexes {
+            map.entry(page_id).or_default().push(slot_id as usize);
+        }
+
+        let mut index_vec = Vec::new();
+        for (page_id, slots) in map {
+            index_vec.push((page_id, slots));
+        }
+
         Self {
             table,
             layout,
             store,
-            indexes,
+            indexes: index_vec,
+            record_iter: None,
             current_index: 0,
         }
     }
 }
 
 impl<'db, S: Store> Iterator for IndexedRowIterator<'db, S> {
-    type Item = Row;
+    type Item = (Record, Row);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut row = None;
+        let mut res = None;
 
-        while row.is_none() && self.current_index < self.indexes.len() {
-            // find next record, which is not deleted
-            let (page_id, slot_id) = &self.indexes[self.current_index];
-            let page = self.store.read_page(self.layout, *page_id, self.table).unwrap();
+        // Using loop instead, would avoid double checking is_none()
+        while res.is_none() {
+            if let Some(record_iter) = self.record_iter.as_mut() {
+                res = record_iter.next().map(|r| {
+                    let row = Row::deserialize(r.data(), self.table.schema());
+                    (r, row)
+                });
 
-            row = page.read_slot(*slot_id as usize)
-                .map(|data| Row::deserialize(data, self.table.schema()));
+                if res.is_none() {
+                    self.record_iter = None;
+                }
 
-            self.current_index += 1;
+            } else {
+                let next = self.indexes.pop();
+                if let Some((page_id, slots)) = next {
+                    // Refactor unwrap here and in PageIterator as well
+                    let page = self.store.read_page(self.layout, page_id, self.table).unwrap();
+                    self.record_iter = Some(RecordIterator::from_slots(page, slots));
+                } else {
+                    return None;
+                }
+            }
         }
 
-        row
+        res
     }
 }
 

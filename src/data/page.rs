@@ -152,18 +152,42 @@ pub struct RecordIterator {
     page_id: i32,
     data: Rc<Vec<u8>>,
     slots: Vec<Slot>,
-    slot_index: usize,
+    next_slot: usize,
 }
 
 impl RecordIterator {
+
+    pub fn from_slots(mut page: Page, slot_ids: Vec<usize>) -> Self {
+        let slots = page.slots.drain(..).into_iter()
+            .enumerate()
+            .filter(|(index, _)| slot_ids.contains(index) )
+            .map(|(_, s)| s)
+            .collect();
+
+        Self {
+            page_id: page.page_id(),
+            data: Rc::new(page.data),
+            slots,
+            next_slot: 0,
+        }
+    }
 
     pub fn new(page: Page) -> Self {
         Self {
             page_id: page.page_id(),
             data: Rc::new(page.data),
             slots: page.slots,
-            slot_index: 0,
+            next_slot: 0,
         }
+    }
+}
+
+fn record_from_slot(page_id: i32, data: Rc<Vec<u8>>, slot_index: usize, slot: &Slot) -> Record {
+    let data_to = slot.page_offset + slot.record_length as usize;
+    Record {
+        page_id: page_id,
+        record_index: slot_index,
+        data: RecordData::new(data, slot.page_offset, data_to),
     }
 }
 
@@ -173,21 +197,16 @@ impl Iterator for RecordIterator {
     fn next(&mut self) -> Option<Self::Item> {
         let mut found = None;
 
-        while self.slot_index < self.slots.len() && found.is_none() {
-            let slot = &self.slots[self.slot_index];
+        while self.next_slot < self.slots.len() && found.is_none() {
+            let slot = &self.slots[self.next_slot];
 
             if !slot.deleted {
-                let data_to = slot.page_offset + slot.record_length as usize;
-                let record = Record {
-                    page_id: self.page_id,
-                    record_index: self.slot_index,
-                    data: RecordData::new(Rc::clone(&self.data), slot.page_offset, data_to),
-                };
+                let record = record_from_slot(self.page_id, Rc::clone(&self.data), self.next_slot, slot) ;
 
                 found = Some(record);
             }
 
-            self.slot_index += 1;
+            self.next_slot += 1;
         }
 
         found
@@ -283,9 +302,7 @@ impl<'database> Page<'database> {
     pub fn read_slot(&self, slot_id: usize) -> Option<&[u8]> {
         self.slots.get(slot_id)
             .filter(|slot| !slot.deleted)
-            .map(|slot| {
-                self.read_data(slot)
-            })
+            .map(|slot| self.read_data(slot))
     }
 
     fn max_fragmented_free_space(&self) -> usize {

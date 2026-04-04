@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap};
 
 use thiserror::Error;
 
-use crate::{data::page::{PageDataLayout, PageError, Record}, store::{PageIterator, PageRowIterator, Store}, table::{Column, TableSchema, table::{Cell, Row, RowValidationError, Table}}, tree::store::BTreeStore};
+use crate::{data::page::{PageDataLayout, PageError, Record}, store::{IndexedRowIterator, PageIterator, PageRowIterator, Store}, table::{Column, TableSchema, table::{Cell, Row, RowValidationError, Table}}, tree::store::BTreeStore};
 
 pub struct TableAccess<'db, S: ?Sized> {
     table: &'db Table,
@@ -10,6 +10,8 @@ pub struct TableAccess<'db, S: ?Sized> {
     indexed_columns: Vec<(i32, RefCell<BTreeStore>)>,
     store: &'db S,
     layout: &'db PageDataLayout,
+    #[cfg(test)]
+    index_used: RefCell<Vec<i32>>, // just values from find clause
 }
 
 #[derive(Error, Debug)]
@@ -87,6 +89,16 @@ impl<'db, I: 'db> QueryResult<'db, I> {
 }
 
 impl<'db> QueryResult<'db, (Record, Row)> {
+    pub fn from_indexes<S: Store>(
+        index_iter: IndexedRowIterator<'_, S>,
+        schema: TableSchema,
+    ) -> QueryResult<'_, (Record, Row)> {
+        QueryResult {
+            row_iter: Box::new(index_iter),
+            schema: schema.clone()
+        }
+    }
+
     pub fn new<S: Store>(
         page_iter: PageIterator<'_, S>,
         schema: TableSchema,
@@ -216,6 +228,8 @@ impl<'db, S: Store> TableAccess<'db, S> {
             store,
             layout,
             indexed_columns: Vec::new(),
+            #[cfg(test)]
+            index_used: RefCell::new(Vec::new()),
          }
     }
 
@@ -233,14 +247,35 @@ impl<'db, S: Store> TableAccess<'db, S> {
     }
 
     pub fn find(&self, col_name: &str, cell: Cell) -> Result<QueryResult<'db, (Record, Row)>, TableAccessError> {
-        // Full table scan:
         let col_index = find_column_for_query_by_cell(self.table.schema(), col_name, &cell)?;
 
-        let page_iter = PageIterator::new(self.table, self.store, self.layout);
-        let qr = QueryResult::new(page_iter, self.table.schema().clone());
-        Ok(qr.filter(move |(_, row)| {
-            row.cells()[col_index] == cell
-        }))
+        // check index for column index:
+        let col_index_map = self.column_index_to_btree_pointer_map()?;
+        if let Some(btree_pointer) = col_index_map.get(&col_index) {
+            let val = cell.expect_int("Indexed values need to be of type Int")
+                .map_err(|e| TableAccessError::LoadRowsError(e.to_string()))?;
+
+            // This will later return an Vec<(i32, i32)> for non unique indexes
+            let res = self.indexed_columns[*btree_pointer].1.borrow().find(val)
+                .map_err(|e| TableAccessError::LoadRowsError(e.to_string()))?
+                .map(|v| vec![v])
+                .unwrap_or_default();
+
+            let iter = IndexedRowIterator::new(self.table, self.store, self.layout, res);
+            let qr = QueryResult::from_indexes(iter, self.table.schema().clone());
+
+            #[cfg(test)]
+            self.index_used.borrow_mut().push(val);
+        
+            Ok(qr)
+        } else {
+            let page_iter = PageIterator::new(self.table, self.store, self.layout);
+            let qr = QueryResult::new(page_iter, self.table.schema().clone());
+
+            Ok(qr.filter(move |(_, row)| {
+                row.cells()[col_index] == cell
+            }))
+        }
     }
 
     pub fn delete(&self, query_result: QueryResult<(Record, Row)>) -> Result<(), TableAccessError> {
@@ -616,16 +651,153 @@ mod tests {
 
     #[test]
     fn should_ensure_unique_values() {
-        assert!(false);
-    }
-    #[test]
-    fn should_insert_into_index() {
-        assert!(false);
+        let schema = TableSchema::new(vec![
+            Column::new(1, "value", ColumnType::Int),
+            Column::new(2, "byte", ColumnType::Byte),
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(32).unwrap();
+        store.create(&layout, &table).unwrap();
+
+        let btree = RefCell::new(store.read_btree(1).unwrap());
+
+        let access = TableAccess::new(&table, &store, &layout)
+            .with_indexes(vec![(1, btree)]);
+
+        let first_row = Row::new(vec![
+            Cell::Int(42),
+            Cell::Byte(1),
+        ]);
+        let second_row = Row::new(vec![
+            Cell::Int(42),
+            Cell::Byte(2),
+        ]);
+
+        access.insert(&first_row).unwrap();
+
+        // insert second row should fail
+        let res = access.insert(&second_row);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("Unique key constraint"));
+
+        let rows = access.find_all().unwrap().rows();
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
-    fn should_find_by_using_index() {
-        assert!(false);
+    fn should_insert_using_index() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "value", ColumnType::Int),
+            Column::new(2, "byte", ColumnType::Byte),
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(32).unwrap();
+        store.create(&layout, &table).unwrap();
+
+        let btree = RefCell::new(store.read_btree(1).unwrap());
+
+        let access = TableAccess::new(&table, &store, &layout)
+            .with_indexes(vec![(1, btree)]);
+
+        let first_row = Row::new(vec![
+            Cell::Int(42),
+            Cell::Byte(1),
+        ]);
+
+        access.insert(&first_row).unwrap();
+
+        // Assert: BTree has stored the correct location of the value
+        let btree = store.read_btree(1).unwrap();
+        let result = btree.find(42).unwrap();
+        assert!(result.is_some());
+        let (page_id, slot_id) = result.unwrap();
+        let page = store.read_page(&layout, page_id, &table).unwrap();
+
+        let row = page.read_slot(slot_id as usize)
+            .map(|data| Row::deserialize(data, table.schema())).unwrap();
+
+        let cells = row.cells();
+        assert_eq!(cells, &vec![Cell::Int(42), Cell::Byte(1)]);
+    }
+
+    #[test]
+    fn should_find_using_index() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "value", ColumnType::Int),
+            Column::new(2, "byte", ColumnType::Byte),
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(32).unwrap();
+        store.create(&layout, &table).unwrap();
+
+        let btree = RefCell::new(store.read_btree(1).unwrap());
+
+        let access = TableAccess::new(&table, &store, &layout)
+            .with_indexes(vec![(1, btree)]);
+
+        let first_row = Row::new(vec![
+            Cell::Int(42),
+            Cell::Byte(1),
+        ]);
+
+        access.insert(&first_row).unwrap();
+        let query = access.find("value", Cell::Int(42)).unwrap();
+        let indexes_used = access.index_used.borrow();
+        assert_eq!(*indexes_used, vec![42]);
+
+        let rows = query.rows();
+        let cells = rows[0].1.cells();
+
+        assert_eq!(
+            cells,
+            &vec![
+                Cell::Int(42),
+                Cell::Byte(1),
+            ]  
+        );
+
+    }
+
+    #[test]
+    fn should_use_index_on_delete() {
+        let schema = TableSchema::new(vec![
+            Column::new(1, "value", ColumnType::Int),
+            Column::new(2, "byte", ColumnType::Byte),
+        ]);
+
+        let table = Table::new(1, "test".to_owned(), schema);
+        let base_dir = tempdir().unwrap();
+        let store = FileStore::new(base_dir.path());
+        let layout = PageDataLayout::new(32).unwrap();
+        store.create(&layout, &table).unwrap();
+
+        let btree = RefCell::new(store.read_btree(1).unwrap());
+
+        let access = TableAccess::new(&table, &store, &layout)
+            .with_indexes(vec![(1, btree)]);
+
+        let first_row = Row::new(vec![
+            Cell::Int(42),
+            Cell::Byte(1),
+        ]);
+
+        access.insert(&first_row).unwrap();
+        let query = access.find("value", Cell::Int(42)).unwrap();
+        access.delete(query).unwrap();
+
+        let btree = store.read_btree(1).unwrap();
+        let result = btree.find(42).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
@@ -675,7 +847,7 @@ mod tests {
         let next = iter.next();
         assert!(next.is_some());
         let next_row = next.unwrap();
-        let cells = next_row.cells();
+        let cells = next_row.1.cells();
         assert_eq!(cells, &vec![Cell::Int(99), Cell::Byte(2)]);
         assert!(iter.next().is_none());
     }
