@@ -246,17 +246,28 @@ impl<'db, S: Store> TableAccess<'db, S> {
     pub fn delete(&self, query_result: QueryResult<(Record, Row)>) -> Result<(), TableAccessError> {
         let mut page_row_map = HashMap::new();
 
-        for (record, _) in query_result.rows() {
+        let col_index_btree_map = self.column_index_to_btree_pointer_map()?;
+
+        for (record, row) in query_result.rows() {
             let delete_tuples = page_row_map.entry(*record.page_id()).or_insert(Vec::new());
-            delete_tuples.push(record);
+            let mut uic = UpdateIndexCommand::new();
+
+            for (col_idx, btree_idx) in col_index_btree_map.iter() {
+                let val = row.cells()[*col_idx].expect_int("Indexed value must be of type Int")
+                    .map_err(|e| TableAccessError::DeleteRowsError(e.to_string()))?;
+                uic.push_delete((*btree_idx, val));
+            }
+
+            delete_tuples.push((record, uic));
         }
 
-        for (page_id, records_to_delete) in page_row_map.iter() {
-            for record in records_to_delete.iter() {
-                let mut page = self.store.read_page(self.layout, *page_id, self.table)
-                .map_err(|e| TableAccessError::DeleteRowsError(e.to_string()))?;
+        for (page_id, records_to_delete) in page_row_map {
+            for (record, uic) in records_to_delete {
+                let mut page = self.store.read_page(self.layout, page_id, self.table)
+                    .map_err(|e| TableAccessError::DeleteRowsError(e.to_string()))?;
 
                 page.delete_record(*record.record_index());
+                self.update_index(page_id, *record.record_index(), uic)?;
 
                 self.store.write_page(self.layout, &page, self.table)
                     .map_err(|e| TableAccessError::DeleteRowsError(e.to_string()))?;
