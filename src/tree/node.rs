@@ -12,7 +12,6 @@ use thiserror::Error;
 use crate::tree::store::{NodePager, NodePagerError};
 
 fn binary_search(key: &i32, keys: &[i32]) -> FindKeyResponse {
-    println!("find {} in {:?}", key, keys);
     let last_element = keys.len().saturating_sub(1);
     let mut high = last_element;
     let mut low = 0;

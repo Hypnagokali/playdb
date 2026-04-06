@@ -158,8 +158,7 @@ impl From<(Vec<u8>, u16)> for NodePage {
             let val2_bytes: [u8; 4] = page_bytes[(next_offset + 4)..(next_offset + 8)].try_into().unwrap();
             let val1 = i32::from_be_bytes(val1_bytes);
             let val2 = i32::from_be_bytes(val2_bytes);
-            // Only add if both values are not -1 (which represents NULL)
-            if val1 != -1 && val2 != -1 {
+            if val1 != i32::MIN && val2 != i32::MIN {
                 values.push((val1, val2));
             } else {
                 break;
@@ -242,27 +241,43 @@ impl NodePager {
         data[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].copy_from_slice(&get_u32_be_bytes_from_option(node.next_deleted_page()));
 
         // build Node
+        // Serialize Keys:
         let key_offset = key_offset();
+        
         for (i, k) in node.keys().iter().enumerate() {
             let current_offset = key_offset + (i * 4);
             data[current_offset..(current_offset + 4)].copy_from_slice(&k.to_be_bytes());
         }
 
+        // Padding keys with NULL (i32::MIN)        
         let child_offset = children_offset(meta_data.max_degree);
+        let keys_end = key_offset + (node.keys().len() * 4);
+        for offset in (keys_end..child_offset).step_by(4) {
+            data[offset..(offset + 4)].copy_from_slice(&i32::MIN.to_be_bytes());
+        }
+
+        // Serialize children:
         for (i, c) in node.children().iter().enumerate() {
             let current_offset = child_offset + (i * 4);
             data[current_offset..(current_offset + 4)].copy_from_slice(&c.to_be_bytes());
         }
 
+        // Serialize values
         let values_offset = values_offset(meta_data.max_degree);
         for (i, v) in node.values().iter().enumerate() {
             let current_offset = values_offset + (i * 8);
             data[current_offset..(current_offset + 4)].copy_from_slice(&v.0.to_be_bytes());
             data[(current_offset + 4)..(current_offset + 8)].copy_from_slice(&v.1.to_be_bytes());
         }
-
+        
+        // Padding values with NULL (i32::MIN)    
         let next_leaf_offset = next_leaf_offset(meta_data.max_degree);
+        let values_end = values_offset + (node.values().len() * 8);
+        for offset in (values_end..next_leaf_offset).step_by(4) {
+            data[offset..(offset + 4)].copy_from_slice(&i32::MIN.to_be_bytes());
+        }
 
+        // Serialize next_leaf (linked list between leafs)
         data[next_leaf_offset..(next_leaf_offset + 4)].copy_from_slice(
             &get_u32_be_bytes_from_option(node.next_leaf())
         );
@@ -328,6 +343,7 @@ impl NodePager {
             };
         } else {
             self.meta_data.borrow_mut().inc_number_of_pages();
+            // first id is 0;
             let next_id = self.meta_data.borrow().number_of_pages - 1;
             let node = NodePage::new(self.meta_data.borrow().max_degree as usize, next_id);
             self.write_page(&node)?;
