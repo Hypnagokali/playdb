@@ -158,8 +158,7 @@ impl From<(Vec<u8>, u16)> for NodePage {
             let val2_bytes: [u8; 4] = page_bytes[(next_offset + 4)..(next_offset + 8)].try_into().unwrap();
             let val1 = i32::from_be_bytes(val1_bytes);
             let val2 = i32::from_be_bytes(val2_bytes);
-            // Only add if both values are not -1 (which represents NULL)
-            if val1 != -1 && val2 != -1 {
+            if val1 != i32::MIN && val2 != i32::MIN {
                 values.push((val1, val2));
             } else {
                 break;
@@ -242,27 +241,43 @@ impl NodePager {
         data[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].copy_from_slice(&get_u32_be_bytes_from_option(node.next_deleted_page()));
 
         // build Node
+        // Serialize Keys:
         let key_offset = key_offset();
+        
         for (i, k) in node.keys().iter().enumerate() {
             let current_offset = key_offset + (i * 4);
             data[current_offset..(current_offset + 4)].copy_from_slice(&k.to_be_bytes());
         }
 
+        // Padding keys with NULL (i32::MIN)        
         let child_offset = children_offset(meta_data.max_degree);
+        let keys_end = key_offset + (node.keys().len() * 4);
+        for offset in (keys_end..child_offset).step_by(4) {
+            data[offset..(offset + 4)].copy_from_slice(&i32::MIN.to_be_bytes());
+        }
+
+        // Serialize children:
         for (i, c) in node.children().iter().enumerate() {
             let current_offset = child_offset + (i * 4);
             data[current_offset..(current_offset + 4)].copy_from_slice(&c.to_be_bytes());
         }
 
+        // Serialize values
         let values_offset = values_offset(meta_data.max_degree);
         for (i, v) in node.values().iter().enumerate() {
             let current_offset = values_offset + (i * 8);
             data[current_offset..(current_offset + 4)].copy_from_slice(&v.0.to_be_bytes());
             data[(current_offset + 4)..(current_offset + 8)].copy_from_slice(&v.1.to_be_bytes());
         }
-
+        
+        // Padding values with NULL (i32::MIN)    
         let next_leaf_offset = next_leaf_offset(meta_data.max_degree);
+        let values_end = values_offset + (node.values().len() * 8);
+        for offset in (values_end..next_leaf_offset).step_by(4) {
+            data[offset..(offset + 4)].copy_from_slice(&i32::MIN.to_be_bytes());
+        }
 
+        // Serialize next_leaf (linked list between leafs)
         data[next_leaf_offset..(next_leaf_offset + 4)].copy_from_slice(
             &get_u32_be_bytes_from_option(node.next_leaf())
         );
@@ -328,6 +343,7 @@ impl NodePager {
             };
         } else {
             self.meta_data.borrow_mut().inc_number_of_pages();
+            // first id is 0;
             let next_id = self.meta_data.borrow().number_of_pages - 1;
             let node = NodePage::new(self.meta_data.borrow().max_degree as usize, next_id);
             self.write_page(&node)?;
@@ -370,6 +386,10 @@ impl BTreeStore {
     pub fn new(file_path: &Path, max_degree: u16) -> Result<Self, BTreeStoreError> {
         if max_degree < 4 {
             return Err(BTreeStoreError { msg: "BTreeStore must have at least a max degree of 4".to_owned() });
+        }
+
+        if max_degree % 2 != 0 {
+            return Err(BTreeStoreError { msg: "BTreeStore must have an even number for max degree".to_owned() });
         }
 
         let store_meta_data;
@@ -444,6 +464,11 @@ impl BTreeStore {
             Ok(r) => r.print_all_nodes(&self.pager),
             _ => (),
         }
+    }
+
+    #[cfg(test)]
+    pub fn validate(&self) {
+        self.root().unwrap().validate(&self.pager, None, None);
     }
 
     pub fn next_node(&self, node: &NodePage) -> Result<Option<NodePage>, BTreeStoreError> {
@@ -564,8 +589,13 @@ impl BTreeStore {
 
         if root.keys().is_empty() && !root.is_leaf() {
             // Special case where keys are empty and children has length 1 (after merging)
+            // This case exists because of the preemptive merge on delete:
+            // The root has exactly one key and the two children will be merged
+            // The separator key is then taken from the root, so the the root has no key left after this action.
+            // The only child gets the new root.
             debug_assert_eq!(root.children().len(), 1, "Internal root node must have exactly 1 child when it is out of keys");
             let new_root = root.children_mut().remove(0);
+            self.pager.delete_page(*root.id())?;
             root = self.pager.read_page(new_root)?;
             self.meta_data.borrow_mut().root = Some(new_root);
         }
@@ -596,9 +626,11 @@ impl BTreeStore {
         let root = self.meta_data.borrow().root;
 
         match root {
-            Some(root_id) => Ok(self.pager.read_page(root_id)?),
+            Some(root_id) => {
+                Ok(self.pager.read_page(root_id)?)
+            }
             None => {
-                let new_root = self.pager.allocate_new_page()?;
+                let mut new_root = self.pager.allocate_new_page()?;
                 self.meta_data.borrow_mut().root = Some(*new_root.id());
                 self.save_metadata()?;
                 Ok(new_root)
@@ -610,9 +642,60 @@ impl BTreeStore {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
+
     use tempfile::NamedTempFile;
 
     use crate::tree::{store::BTreeStore, node::NodePage};
+
+    #[test]
+    fn should_be_valid_after_lot_of_inserts_and_deletes() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut tree= BTreeStore::new(temp.path(), 8).unwrap();
+        let max_inserts = 1000;
+
+        #[derive(Debug)]
+        struct CurrentState {
+            inserted_even: i32,
+            inserted_uneven: i32,
+            deleted: i32,
+            do_validate: bool,
+        }
+
+        let mut current_state = CurrentState {
+            inserted_even: 0,
+            inserted_uneven: 0,
+            deleted: 0,
+            do_validate: false,
+        };
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            // Insert even numbers
+            for i in (2..max_inserts).step_by(2) {
+                tree.insert(i, (0,0));
+                current_state.inserted_even += 1;
+            }
+
+            // Insert odd numbers
+            for i in (1..max_inserts).step_by(2) {
+                tree.insert(i, (0,0));
+                current_state.inserted_uneven += 1;
+            }
+
+            // Delete every 3rd element
+            for i in (0..max_inserts).step_by(3) {
+                tree.delete(i);
+                current_state.deleted += 1;
+            }
+
+            current_state.do_validate = true;
+            tree.validate();
+        }));
+
+        assert!(result.is_ok(), "B+ Tree panicked at: {:?} (max_inserts: {})", current_state, max_inserts);
+
+    }
+
 
     #[test]
     fn find_left_most_node() {

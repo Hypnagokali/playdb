@@ -11,6 +11,38 @@ use thiserror::Error;
 
 use crate::tree::store::{NodePager, NodePagerError};
 
+fn binary_search(key: &i32, keys: &[i32]) -> FindKeyResponse {
+    let last_element = keys.len().saturating_sub(1);
+    let mut high = last_element;
+    let mut low = 0;
+
+    if keys.len() == 0 {
+        return FindKeyResponse::GreaterThanTheLast(last_element);
+    }
+    
+    let mut mid;
+    while (high - low > 8) {
+        mid = (low + high) / 2;
+        if key < &keys[mid] {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    for i in low..high + 1 {
+        let k = &keys[i];
+        if key < k {
+            return FindKeyResponse::LessThan(i);
+        } else if key == k {
+            return FindKeyResponse::Equal(i);
+        }
+    }
+
+    return FindKeyResponse::GreaterThanTheLast(last_element);
+}
+
+#[derive(Debug)]
 enum FindKeyResponse {
     GreaterThanTheLast(usize),
     Equal(usize),
@@ -52,7 +84,6 @@ pub struct NodePage {
     next_leaf: Option<u32>, // Linked list to next leaf-node (if leaf) 
     max_degree: usize,
     changed: Rc<RefCell<bool>>, // flag is not stored, indicates, if the node has been changed
-    // next_leaf: Option<u32> TODO: linked list between leaves
 }
 
 impl NodePage {
@@ -142,7 +173,7 @@ impl NodePage {
     // }
 
     pub fn min_keys(&self) -> usize {
-        (self.max_keys() as f32 / 2.0).ceil() as usize
+        (self.max_degree / 2) - 1
     }
 
     pub fn max_keys(&self) -> usize {
@@ -153,35 +184,37 @@ impl NodePage {
         self.children.is_empty()
     }
 
-    // #[cfg(test)]
-    // fn validate(&self, min_key: Option<u32>, max_key: Option<u32>) {
-    //     self.check_node_invariants();
-    //     if let Some(min_key) = min_key {
-    //         assert!(self.keys.iter().all(|k| *k >= min_key), "All Keys must be greater or equal than min_key. min_key: {}, keys:{:?}", min_key, self.keys);
-    //     }
+    #[cfg(test)]
+    pub (crate) fn validate(&self, pager: &NodePager, min_key: Option<i32>, max_key: Option<i32>) {
+        self.check_node_invariants(pager);
+        if let Some(min_key) = min_key {
+            assert!(self.keys.iter().all(|k| *k >= min_key), "All Keys must be greater or equal than min_key. min_key: {}, keys:{:?}", min_key, self.keys);
+        }
 
-    //     if let Some(max_key) = max_key {
-    //         assert!(self.keys.iter().all(|k| *k < max_key), "All Keys must be less than max_key. max_key: {}, keys:{:?}", max_key, self.keys);
-    //     }
+        if let Some(max_key) = max_key {
+            assert!(self.keys.iter().all(|k| *k < max_key), "All Keys must be less than max_key. max_key: {}, keys:{:?}", max_key, self.keys);
+        }
 
-    //     for i in 0..self.children.len() {
-    //         let child_min = match i {
-    //             0 => min_key,
-    //             _ => Some(self.keys[i - 1]),
-    //         };
+        for i in 0..self.children.len() {
+            let child_min = match i {
+                0 => min_key,
+                _ => Some(self.keys[i - 1]),
+            };
 
-    //         let child_max = match i {
-    //             i if i < self.keys.len() => Some(self.keys[i]),
-    //             _ => max_key,
-    //         };
+            let child_max = match i {
+                i if i < self.keys.len() => Some(self.keys[i]),
+                _ => max_key,
+            };
 
-    //         self.children[i].validate(child_min, child_max);
-    //     }
-    // }
+            let page = pager.read_page(self.children[i]).unwrap();
+
+            page.validate(pager, child_min, child_max);
+        }
+    }
 
     #[cfg(test)]
     fn check_node_invariants(&self, pager: &NodePager) {
-        assert!(!self.keys.is_empty(), "Keys must never be empty: {:?}", self);
+        assert!(!self.keys.is_empty(), "Keys must never be empty (if not root node): {:?}", self);
         if self.is_leaf() {
             assert_eq!(self.children.len(), 0, "Children in leaf must be always empty");
             assert_eq!(self.values.len(), self.keys.len(), "Every key must have a value in a leaf");
@@ -272,15 +305,7 @@ impl NodePage {
     }
 
     fn find_key_index(&self, key: i32) -> FindKeyResponse {
-        for (i, &k) in self.keys.iter().enumerate() {
-            if key < k {
-                return FindKeyResponse::LessThan(i);
-            } else if key == k {
-                return FindKeyResponse::Equal(i);
-            }
-        }
-        
-        FindKeyResponse::GreaterThanTheLast(self.keys.len().saturating_sub(1))
+        binary_search(&key, &self.keys)
     }
 
     #[cfg(test)]
@@ -433,14 +458,15 @@ impl NodePage {
     // Delete a key from this subtree. Returns the removed value if present.
     pub fn delete(&mut self, pager: &NodePager, key: i32) -> Result<Option<(i32, i32)>, NodeOperationError> {
         if self.is_leaf() {
-            // TODO: use binary search
-            if let Some(pos) = self.keys.iter().position(|k| *k == key) {
-                self.keys.remove(pos);
-                let v = self.values.remove(pos);
-                *self.changed.borrow_mut() = true;
-                return Ok(Some(v));
+            match binary_search(&key, &self.keys) {
+                FindKeyResponse::Equal(pos) => {
+                    self.keys.remove(pos);
+                    let v = self.values.remove(pos);
+                    *self.changed.borrow_mut() = true;
+                        return Ok(Some(v));
+                },
+                _ => return Ok(None),
             }
-            return Ok(None);
         }
 
         let node_index = self.keys.iter().enumerate()
@@ -491,6 +517,12 @@ impl NodePage {
                 *left_node.changed.borrow_mut() = true;
                 *self.changed.borrow_mut() = true;
 
+                #[cfg(test)]
+                {
+                    target_node.check_node_invariants(pager);
+                    left_node.check_node_invariants(pager);
+                }
+
                 pager.write_page(&target_node)?;
                 pager.write_page(&left_node)?;
             } else if let Some((mut right_node, true)) = right_neighbor_can_lend {
@@ -513,6 +545,12 @@ impl NodePage {
                 *target_node.changed.borrow_mut() = true;
                 *right_node.changed.borrow_mut() = true;
                 *self.changed.borrow_mut() = true;
+
+                #[cfg(test)]
+                {
+                    target_node.check_node_invariants(pager);
+                    right_node.check_node_invariants(pager);
+                }
 
                 pager.write_page(&target_node)?;
                 pager.write_page(&right_node)?;
@@ -539,6 +577,10 @@ impl NodePage {
                     }
                     *left_node.changed.borrow_mut() = true;
                     *self.changed.borrow_mut() = true;
+                    #[cfg(test)]
+                    {
+                        left_node.check_node_invariants(pager);
+                    }
                     pager.write_page(&left_node)?;
                     pager.delete_page(*target_node.id())?;
 
@@ -562,6 +604,11 @@ impl NodePage {
 
                     *target_node.changed.borrow_mut() = true;
                     *self.changed.borrow_mut() = true;
+
+                    #[cfg(test)]
+                    {
+                        target_node.check_node_invariants(pager);
+                    }
                     pager.write_page(&target_node)?;
                     pager.delete_page(*right_node.id())?;
                 }
@@ -574,4 +621,38 @@ impl NodePage {
 
         res
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tree::node::{FindKeyResponse, binary_search};
+
+    #[test]
+    fn should_find_index_for_value_smaller_than_index_7() {
+        let keys = vec![1, 2, 3, 4, 5, 6, 60, 70, 80, 90, 91, 92, 93, 94, 95, 105, 110, 200, 500];
+        let index = binary_search(&68, &keys);
+        assert!(matches!(index, FindKeyResponse::LessThan(7)), "Should be LessThan(7) but is {:?}", index);
+    }
+
+    #[test]
+    fn should_find_index_for_value_smaller_than_index_18() {
+        let keys = vec![1, 2, 3, 4, 20, 50, 60, 70, 80, 90, 91, 92, 93, 94, 95, 105, 110, 200, 500];
+        let index = binary_search(&400, &keys);
+        assert!(matches!(index, FindKeyResponse::LessThan(18)), "Should be LessThan(18) but is {:?}", index);
+    }
+
+    #[test]
+    fn should_find_last_index_greater_than_last() {
+        let keys = vec![1, 2, 3, 4, 20, 50, 60, 70, 80, 90, 91, 92, 93, 94, 95, 105, 110, 200, 500];
+        let index = binary_search(&600, &keys);
+        assert!(matches!(index, FindKeyResponse::GreaterThanTheLast(18)), "Should be GreaterThanTheLast(18) but is {:?}", index);
+    }
+
+    #[test]
+    fn should_find_value_that_is_equal() {
+        let keys = vec![1, 2, 3, 4, 20, 50, 60, 70, 80, 90, 91, 92, 93, 94, 95, 105, 110, 200, 500];
+        let index = binary_search(&1, &keys);
+        assert!(matches!(index, FindKeyResponse::Equal(0)), "Should be Equal(0) but is {:?}", index);
+    }
+
 }
