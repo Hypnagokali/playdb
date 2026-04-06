@@ -372,6 +372,10 @@ impl BTreeStore {
             return Err(BTreeStoreError { msg: "BTreeStore must have at least a max degree of 4".to_owned() });
         }
 
+        if max_degree % 2 != 0 {
+            return Err(BTreeStoreError { msg: "BTreeStore must have an even number for max degree".to_owned() });
+        }
+
         let store_meta_data;
 
         let file_size = fs::metadata(file_path).ok()
@@ -444,6 +448,11 @@ impl BTreeStore {
             Ok(r) => r.print_all_nodes(&self.pager),
             _ => (),
         }
+    }
+
+    #[cfg(test)]
+    pub fn validate(&self) {
+        self.root().unwrap().validate(&self.pager, None, None);
     }
 
     pub fn next_node(&self, node: &NodePage) -> Result<Option<NodePage>, BTreeStoreError> {
@@ -564,8 +573,13 @@ impl BTreeStore {
 
         if root.keys().is_empty() && !root.is_leaf() {
             // Special case where keys are empty and children has length 1 (after merging)
+            // This case exists because of the preemptive merge on delete:
+            // The root has exactly one key and the two children will be merged
+            // The separator key is then taken from the root, so the the root has no key left after this action.
+            // The only child gets the new root.
             debug_assert_eq!(root.children().len(), 1, "Internal root node must have exactly 1 child when it is out of keys");
             let new_root = root.children_mut().remove(0);
+            self.pager.delete_page(*root.id())?;
             root = self.pager.read_page(new_root)?;
             self.meta_data.borrow_mut().root = Some(new_root);
         }
@@ -596,9 +610,11 @@ impl BTreeStore {
         let root = self.meta_data.borrow().root;
 
         match root {
-            Some(root_id) => Ok(self.pager.read_page(root_id)?),
+            Some(root_id) => {
+                Ok(self.pager.read_page(root_id)?)
+            }
             None => {
-                let new_root = self.pager.allocate_new_page()?;
+                let mut new_root = self.pager.allocate_new_page()?;
                 self.meta_data.borrow_mut().root = Some(*new_root.id());
                 self.save_metadata()?;
                 Ok(new_root)
@@ -610,9 +626,60 @@ impl BTreeStore {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
+
     use tempfile::NamedTempFile;
 
     use crate::tree::{store::BTreeStore, node::NodePage};
+
+    #[test]
+    fn should_be_valid_after_lot_of_inserts_and_deletes() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut tree= BTreeStore::new(temp.path(), 8).unwrap();
+        let max_inserts = 1000;
+
+        #[derive(Debug)]
+        struct CurrentState {
+            inserted_even: i32,
+            inserted_uneven: i32,
+            deleted: i32,
+            do_validate: bool,
+        }
+
+        let mut current_state = CurrentState {
+            inserted_even: 0,
+            inserted_uneven: 0,
+            deleted: 0,
+            do_validate: false,
+        };
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            // Insert even numbers
+            for i in (2..max_inserts).step_by(2) {
+                tree.insert(i, (0,0));
+                current_state.inserted_even += 1;
+            }
+
+            // Insert odd numbers
+            for i in (1..max_inserts).step_by(2) {
+                tree.insert(i, (0,0));
+                current_state.inserted_uneven += 1;
+            }
+
+            // Delete every 3rd element
+            for i in (0..max_inserts).step_by(3) {
+                tree.delete(i);
+                current_state.deleted += 1;
+            }
+
+            current_state.do_validate = true;
+            tree.validate();
+        }));
+
+        assert!(result.is_ok(), "B+ Tree panicked at: {:?} (max_inserts: {})", current_state, max_inserts);
+
+    }
+
 
     #[test]
     fn find_left_most_node() {

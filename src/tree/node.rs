@@ -142,7 +142,7 @@ impl NodePage {
     // }
 
     pub fn min_keys(&self) -> usize {
-        (self.max_keys() as f32 / 2.0).ceil() as usize
+        (self.max_degree / 2) - 1
     }
 
     pub fn max_keys(&self) -> usize {
@@ -153,35 +153,37 @@ impl NodePage {
         self.children.is_empty()
     }
 
-    // #[cfg(test)]
-    // fn validate(&self, min_key: Option<u32>, max_key: Option<u32>) {
-    //     self.check_node_invariants();
-    //     if let Some(min_key) = min_key {
-    //         assert!(self.keys.iter().all(|k| *k >= min_key), "All Keys must be greater or equal than min_key. min_key: {}, keys:{:?}", min_key, self.keys);
-    //     }
+    #[cfg(test)]
+    pub (crate) fn validate(&self, pager: &NodePager, min_key: Option<i32>, max_key: Option<i32>) {
+        self.check_node_invariants(pager);
+        if let Some(min_key) = min_key {
+            assert!(self.keys.iter().all(|k| *k >= min_key), "All Keys must be greater or equal than min_key. min_key: {}, keys:{:?}", min_key, self.keys);
+        }
 
-    //     if let Some(max_key) = max_key {
-    //         assert!(self.keys.iter().all(|k| *k < max_key), "All Keys must be less than max_key. max_key: {}, keys:{:?}", max_key, self.keys);
-    //     }
+        if let Some(max_key) = max_key {
+            assert!(self.keys.iter().all(|k| *k < max_key), "All Keys must be less than max_key. max_key: {}, keys:{:?}", max_key, self.keys);
+        }
 
-    //     for i in 0..self.children.len() {
-    //         let child_min = match i {
-    //             0 => min_key,
-    //             _ => Some(self.keys[i - 1]),
-    //         };
+        for i in 0..self.children.len() {
+            let child_min = match i {
+                0 => min_key,
+                _ => Some(self.keys[i - 1]),
+            };
 
-    //         let child_max = match i {
-    //             i if i < self.keys.len() => Some(self.keys[i]),
-    //             _ => max_key,
-    //         };
+            let child_max = match i {
+                i if i < self.keys.len() => Some(self.keys[i]),
+                _ => max_key,
+            };
 
-    //         self.children[i].validate(child_min, child_max);
-    //     }
-    // }
+            let page = pager.read_page(self.children[i]).unwrap();
+
+            page.validate(pager, child_min, child_max);
+        }
+    }
 
     #[cfg(test)]
     fn check_node_invariants(&self, pager: &NodePager) {
-        assert!(!self.keys.is_empty(), "Keys must never be empty: {:?}", self);
+        assert!(!self.keys.is_empty(), "Keys must never be empty (if not root node): {:?}", self);
         if self.is_leaf() {
             assert_eq!(self.children.len(), 0, "Children in leaf must be always empty");
             assert_eq!(self.values.len(), self.keys.len(), "Every key must have a value in a leaf");
@@ -491,6 +493,12 @@ impl NodePage {
                 *left_node.changed.borrow_mut() = true;
                 *self.changed.borrow_mut() = true;
 
+                #[cfg(test)]
+                {
+                    target_node.check_node_invariants(pager);
+                    left_node.check_node_invariants(pager);
+                }
+
                 pager.write_page(&target_node)?;
                 pager.write_page(&left_node)?;
             } else if let Some((mut right_node, true)) = right_neighbor_can_lend {
@@ -513,6 +521,12 @@ impl NodePage {
                 *target_node.changed.borrow_mut() = true;
                 *right_node.changed.borrow_mut() = true;
                 *self.changed.borrow_mut() = true;
+
+                #[cfg(test)]
+                {
+                    target_node.check_node_invariants(pager);
+                    right_node.check_node_invariants(pager);
+                }
 
                 pager.write_page(&target_node)?;
                 pager.write_page(&right_node)?;
@@ -539,6 +553,10 @@ impl NodePage {
                     }
                     *left_node.changed.borrow_mut() = true;
                     *self.changed.borrow_mut() = true;
+                    #[cfg(test)]
+                    {
+                        left_node.check_node_invariants(pager);
+                    }
                     pager.write_page(&left_node)?;
                     pager.delete_page(*target_node.id())?;
 
@@ -562,6 +580,11 @@ impl NodePage {
 
                     *target_node.changed.borrow_mut() = true;
                     *self.changed.borrow_mut() = true;
+
+                    #[cfg(test)]
+                    {
+                        target_node.check_node_invariants(pager);
+                    }
                     pager.write_page(&target_node)?;
                     pager.delete_page(*right_node.id())?;
                 }
