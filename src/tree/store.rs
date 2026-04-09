@@ -5,10 +5,10 @@ use ttl_cache::TtlCache;
 
 use crate::tree::node::NodeOperationError;
 
-use super::{get_u32_be_bytes_from_option, get_i32_be_bytes_from_option, read_u32_with_null, read_i32_with_null, node::NodePage};
+use super::{get_i32_be_bytes_from_option, read_i32_with_null, node::NodePage};
 
 // File design:
-// NULL values are currently designed with sentinel values: u32::MAX and i32::MIN
+// NULL values are currently designed with sentinel values: i32::MIN
 // This is not efficient and is only used for simplicity.
 // A better approach would be to use a bitmap to indicate which values are null and which are not. 
 // For example: for 16 possible values store 2 extra bytes to model null values in bits.
@@ -16,8 +16,8 @@ use super::{get_u32_be_bytes_from_option, get_i32_be_bytes_from_option, read_u32
 // Metadata header => 14 Bytes
 // 2 bytes: max_degree
 // 4 bytes: number_of_pages (max: u32:MAX - 1)
-// 4 bytes: first_deleted_page (u32::MAX for INVALID / NULL)
-// 4 bytes: root (u32::MAX for INVALID / NULL)
+// 4 bytes: first_deleted_page (i32::MIN for INVALID / NULL)
+// 4 bytes: root (i32::MIN for INVALID / NULL)
 // -----------------------------------
 // Page
 // Meta-Section:
@@ -25,14 +25,14 @@ use super::{get_u32_be_bytes_from_option, get_i32_be_bytes_from_option, read_u32
 const POS_PAGE_ID: usize = 0;
 // 1 Byte: Deleted (0x00: not deleted, everything else: deleted)
 const POS_DELETED: usize = 4;
-// 4 bytes: next_deleted_page (number of next deleted page, u32::MAX for INVALID / NULL)
+// 4 bytes: next_deleted_page (number of next deleted page, i32::MIN for INVALID / NULL)
 const POS_NEXT_DELETED_PAGE: usize = 5;
 // Node-Section:
 // 9 x 4 bytes: keys
 // 10 x 4 bytes: pageIds
 // 9 x 8 bytes: values (tuples of i32, i32)
 const NEXT_LEAF_SIZE: usize = 4;
-// 4 bytes: next_leaf (linked list) u32:MAX for NULL
+// 4 bytes: next_leaf (linked list) i32::MIN for NULL
 
 // just for playing around, should be encoded in meta data header.
 const PAGE_DATA_START: usize = 9; // same as PAGE_HEADER_SIZE
@@ -72,8 +72,8 @@ fn meta_data_to_bytes(store_meta_data: &StoreMetaData) -> Vec<u8> {
     let mut metadata_bytes = [0u8; META_DATA_HEADER_SIZE];
     metadata_bytes[0..2].copy_from_slice(&store_meta_data.max_degree.to_be_bytes());
     metadata_bytes[2..6].copy_from_slice(&store_meta_data.number_of_pages.to_be_bytes());
-    metadata_bytes[6..10].copy_from_slice(&get_u32_be_bytes_from_option(&store_meta_data.first_deleted_page));
-    metadata_bytes[10..14].copy_from_slice(&get_u32_be_bytes_from_option(&store_meta_data.root));
+    metadata_bytes[6..10].copy_from_slice(&get_i32_be_bytes_from_option(&store_meta_data.first_deleted_page));
+    metadata_bytes[10..14].copy_from_slice(&get_i32_be_bytes_from_option(&store_meta_data.root));
     metadata_bytes.to_vec()
 }
 
@@ -81,8 +81,8 @@ fn meta_data_to_bytes(store_meta_data: &StoreMetaData) -> Vec<u8> {
 pub struct StoreMetaData {
     max_degree: u16,
     number_of_pages: u32, // in total: with deleted pages
-    first_deleted_page: Option<u32>,
-    root: Option<u32>,
+    first_deleted_page: Option<i32>,
+    root: Option<i32>,
     changed: bool, // will not be serialized, is only a flag, if NodePager has changed the meta data
     unique_index: bool, // not serialized yet, because I only deal with unique indexes at the moment (so it's always true)
 }
@@ -93,12 +93,12 @@ impl StoreMetaData {
         self.changed = true;
     }
 
-    pub fn set_first_deleted_page(&mut self, page: Option<u32>) {
+    pub fn set_first_deleted_page(&mut self, page: Option<i32>) {
         self.first_deleted_page = page;
         self.changed = true;
     }
 
-    pub fn set_root(&mut self, root_page_id: u32) {
+    pub fn set_root(&mut self, root_page_id: i32) {
         self.root = Some(root_page_id);
         self.changed = true;
     }
@@ -109,9 +109,9 @@ impl From<(Vec<u8>, u16)> for NodePage {
         let page_bytes = page_bytes_and_degree.0;
         let max_degree = page_bytes_and_degree.1;
 
-        let page_id = u32::from_be_bytes(page_bytes[POS_PAGE_ID..POS_PAGE_ID + 4].try_into().unwrap());
+        let page_id = i32::from_be_bytes(page_bytes[POS_PAGE_ID..POS_PAGE_ID + 4].try_into().unwrap());
 
-        if page_id == u32::MAX {
+        if page_id == i32::MIN {
             panic!("Read a page with INVALID id.");
         }
 
@@ -120,8 +120,8 @@ impl From<(Vec<u8>, u16)> for NodePage {
             _ => true,
         };
 
-        let next_deleted_page = read_u32_with_null(
-            u32::from_be_bytes(page_bytes[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].try_into().unwrap())
+        let next_deleted_page = read_i32_with_null(
+            i32::from_be_bytes(page_bytes[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].try_into().unwrap())
         );
 
         let mut keys = Vec::new();
@@ -141,7 +141,7 @@ impl From<(Vec<u8>, u16)> for NodePage {
         let child_offset = children_offset(max_degree);
         for c in 0..max_degree {
             let next_offset = child_offset + (c as usize * 4);
-            let next_child = read_u32_with_null(u32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
+            let next_child = read_i32_with_null(i32::from_be_bytes(page_bytes[next_offset..(next_offset + 4)].try_into().unwrap()));
             if let Some(next_child) = next_child {
                 children.push(next_child);
             } else {
@@ -166,8 +166,8 @@ impl From<(Vec<u8>, u16)> for NodePage {
         }
 
         let next_leaf_offset = next_leaf_offset(max_degree);
-        let next_leaf = read_u32_with_null(
-            u32::from_be_bytes(page_bytes[next_leaf_offset..next_leaf_offset + 4]
+        let next_leaf = read_i32_with_null(
+            i32::from_be_bytes(page_bytes[next_leaf_offset..next_leaf_offset + 4]
                 .try_into()
                 .unwrap()
             )
@@ -187,7 +187,7 @@ impl From<(Vec<u8>, u16)> for NodePage {
 
 pub struct NodePager {
     file: RefCell<File>,
-    cache: RefCell<TtlCache<u32, NodePage>>,
+    cache: RefCell<TtlCache<i32, NodePage>>,
     meta_data: Rc<RefCell<StoreMetaData>>,
 }
 
@@ -217,12 +217,20 @@ impl NodePager {
         children + keys + values + NEXT_LEAF_SIZE as u32 + PAGE_HEADER_SIZE as u32
     }
 
+    fn page_offset(&self, page_id: i32) -> Result<u64, NodePagerError> {
+        if page_id < 0 {
+            return Err(NodePagerError { msg: format!("Page id must be >= 0. page_id={}", page_id) });
+        }
+
+        Ok(META_DATA_HEADER_SIZE as u64 + (self.page_size() as u64 * page_id as u64))
+    }
+
     pub fn write_page(&self, node: &NodePage) -> Result<(), NodePagerError> {
         if !*node.changed().borrow() {
             return Ok(());
         }
-        if *node.id() == u32::MAX {
-            return Err(NodePagerError { msg: "Cannot save page with the id 0xFFFFFFFF".to_owned() });
+        if *node.id() == i32::MIN {
+            return Err(NodePagerError { msg: "Cannot save page with the id i32::MIN".to_owned() });
         }
         if *node.deleted() {
             return Err(NodePagerError { msg: "Cannot write deleted pages. Use delete for this operation".to_owned() });
@@ -230,7 +238,13 @@ impl NodePager {
         
         let meta_data = self.meta_data.borrow();
         let mut file= self.file.borrow_mut();
-        let mut data = vec![0xFF; self.page_size() as usize];
+        let mut data = vec![0; self.page_size() as usize];
+
+        // Prefill the whole node payload with NULL sentinel (i32::MIN).
+        // Start at key_offset (9), so 4-byte writes stay aligned with all payload fields.
+        for offset in (key_offset()..data.len()).step_by(4) {
+            data[offset..(offset + 4)].copy_from_slice(&i32::MIN.to_be_bytes());
+        }
         
         // build page header
         data[POS_PAGE_ID..POS_PAGE_ID + 4].copy_from_slice(&node.id().to_be_bytes());
@@ -238,7 +252,7 @@ impl NodePager {
             true => 1,
             false => 0,
         };
-        data[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].copy_from_slice(&get_u32_be_bytes_from_option(node.next_deleted_page()));
+        data[POS_NEXT_DELETED_PAGE..POS_NEXT_DELETED_PAGE + 4].copy_from_slice(&get_i32_be_bytes_from_option(node.next_deleted_page()));
 
         // build Node
         // Serialize Keys:
@@ -248,13 +262,7 @@ impl NodePager {
             let current_offset = key_offset + (i * 4);
             data[current_offset..(current_offset + 4)].copy_from_slice(&k.to_be_bytes());
         }
-
-        // Padding keys with NULL (i32::MIN)        
         let child_offset = children_offset(meta_data.max_degree);
-        let keys_end = key_offset + (node.keys().len() * 4);
-        for offset in (keys_end..child_offset).step_by(4) {
-            data[offset..(offset + 4)].copy_from_slice(&i32::MIN.to_be_bytes());
-        }
 
         // Serialize children:
         for (i, c) in node.children().iter().enumerate() {
@@ -262,28 +270,24 @@ impl NodePager {
             data[current_offset..(current_offset + 4)].copy_from_slice(&c.to_be_bytes());
         }
 
-        // Serialize values
         let values_offset = values_offset(meta_data.max_degree);
+
+        // Serialize values
         for (i, v) in node.values().iter().enumerate() {
             let current_offset = values_offset + (i * 8);
             data[current_offset..(current_offset + 4)].copy_from_slice(&v.0.to_be_bytes());
             data[(current_offset + 4)..(current_offset + 8)].copy_from_slice(&v.1.to_be_bytes());
         }
-        
-        // Padding values with NULL (i32::MIN)    
+
         let next_leaf_offset = next_leaf_offset(meta_data.max_degree);
-        let values_end = values_offset + (node.values().len() * 8);
-        for offset in (values_end..next_leaf_offset).step_by(4) {
-            data[offset..(offset + 4)].copy_from_slice(&i32::MIN.to_be_bytes());
-        }
 
         // Serialize next_leaf (linked list between leafs)
         data[next_leaf_offset..(next_leaf_offset + 4)].copy_from_slice(
-            &get_u32_be_bytes_from_option(node.next_leaf())
+            &get_i32_be_bytes_from_option(node.next_leaf())
         );
 
-        let offset = META_DATA_HEADER_SIZE as u32 + (self.page_size() * node.id());
-        file.seek(std::io::SeekFrom::Start(offset as u64))
+        let offset = self.page_offset(*node.id())?;
+        file.seek(std::io::SeekFrom::Start(offset))
             .map_err(|_| NodePagerError { msg: "Cannot go to offset (read_page error)".to_owned() })?;
         file.write(&data)
             .map_err(|e| NodePagerError { msg: format!("Cannot write NodePage: {}", e)})?;
@@ -295,15 +299,15 @@ impl NodePager {
         Ok(())
     }
 
-    pub fn read_page(&self, page_id: u32) -> Result<NodePage, NodePagerError> {
+    pub fn read_page(&self, page_id: i32) -> Result<NodePage, NodePagerError> {
         if let Some(node) = self.cache.borrow().get(&page_id) {
             return Ok(node.clone());
         }
 
         let mut file= self.file.borrow_mut();
         let mut data = vec![0; self.page_size() as usize];
-        let offset = META_DATA_HEADER_SIZE as u32 + (self.page_size() * page_id);
-        file.seek(std::io::SeekFrom::Start(offset as u64))
+        let offset = self.page_offset(page_id)?;
+        file.seek(std::io::SeekFrom::Start(offset))
             .map_err(|_| NodePagerError { msg: "Cannot go to offset (read_page error)".to_owned() })?;
 
         file.read_exact(&mut data)
@@ -312,9 +316,9 @@ impl NodePager {
         Ok((data, self.meta_data.borrow().max_degree).into())
     }
 
-    pub fn delete_page(&self, page_id: u32) -> Result<(), NodePagerError> {
-        if page_id == u32::MAX {
-            return Err(NodePagerError { msg: "Cannot delete page_id 0xFFFFFFFF".to_owned() });
+    pub fn delete_page(&self, page_id: i32) -> Result<(), NodePagerError> {
+        if page_id == i32::MIN {
+            return Err(NodePagerError { msg: "Cannot delete page_id i32::MIN".to_owned() });
         }
 
         let first_deleted_page = self.meta_data.borrow().first_deleted_page;
@@ -345,6 +349,8 @@ impl NodePager {
             self.meta_data.borrow_mut().inc_number_of_pages();
             // first id is 0;
             let next_id = self.meta_data.borrow().number_of_pages - 1;
+            let next_id = i32::try_from(next_id)
+                .map_err(|_| NodePagerError { msg: "Cannot allocate page id greater than i32::MAX".to_owned() })?;
             let node = NodePage::new(self.meta_data.borrow().max_degree as usize, next_id);
             self.write_page(&node)?;
             // is likely to change after allocation
@@ -405,14 +411,14 @@ impl BTreeStore {
 
                 let max_degree = u16::from_be_bytes(metadata_bytes[0..2].try_into().unwrap());
                 let number_of_pages = u32::from_be_bytes(metadata_bytes[2..6].try_into().unwrap());
-                let first_deleted_page = u32::from_be_bytes(metadata_bytes[6..10].try_into().unwrap());
-                let root = u32::from_be_bytes(metadata_bytes[10..14].try_into().unwrap());
+                let first_deleted_page = i32::from_be_bytes(metadata_bytes[6..10].try_into().unwrap());
+                let root = i32::from_be_bytes(metadata_bytes[10..14].try_into().unwrap());
 
                 store_meta_data = StoreMetaData {
                     max_degree,
                     number_of_pages,
-                    first_deleted_page: read_u32_with_null(first_deleted_page),
-                    root: read_u32_with_null(root),
+                    first_deleted_page: read_i32_with_null(first_deleted_page),
+                    root: read_i32_with_null(root),
                     changed: false,
                     unique_index: true,
                 };

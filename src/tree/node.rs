@@ -75,13 +75,13 @@ impl From<NodePagerError> for NodeOperationError {
 // So I've put it off for now :)
 #[derive(Debug, Getters, Clone)]
 pub struct NodePage {
-    id: u32,
+    id: i32,
     deleted: bool,
-    next_deleted_page: Option<u32>,
+    next_deleted_page: Option<i32>,
     keys: Vec<i32>,
-    children: Vec<u32>, // stores page number (page_id)
+    children: Vec<i32>, // stores page number (page_id)
     values: Vec<(i32, i32)>, // each item is a tuple of (page_id, slot)
-    next_leaf: Option<u32>, // Linked list to next leaf-node (if leaf) 
+    next_leaf: Option<i32>, // Linked list to next leaf-node (if leaf) 
     max_degree: usize,
     changed: Rc<RefCell<bool>>, // flag is not stored, indicates, if the node has been changed
 }
@@ -92,7 +92,7 @@ impl NodePage {
         &mut self.keys
     }
 
-    pub fn children_mut(&mut self) -> &mut Vec<u32> {
+    pub fn children_mut(&mut self) -> &mut Vec<i32> {
         *self.changed.borrow_mut() = true;
         &mut self.children
     }
@@ -102,7 +102,7 @@ impl NodePage {
         &mut self.values
     }
 
-    pub fn delete_page(&mut self, next_deleted: Option<u32>) {
+    pub fn delete_page(&mut self, next_deleted: Option<i32>) {
         self.deleted = true;
         *self.changed.borrow_mut() = true;
         self.keys = Vec::new();
@@ -119,9 +119,9 @@ impl NodePage {
         self.values = Vec::new();
         self.next_deleted_page = None;
     }
-    pub fn new(max_degree: usize, id: u32) -> Self {
-        if id == u32::MAX {
-            panic!("Cannot write page with id 0xFFFFFFFF");
+    pub fn new(max_degree: usize, id: i32) -> Self {
+        if id == i32::MIN {
+            panic!("Cannot write page with id i32::MIN");
         }
         Self {
             id,
@@ -137,13 +137,13 @@ impl NodePage {
     }
 
     pub fn new_from_store(
-        id: u32,
+        id: i32,
         deleted: bool,
-        next_deleted_page: Option<u32>,
+        next_deleted_page: Option<i32>,
         keys: Vec<i32>,
-        children: Vec<u32>,
+        children: Vec<i32>,
         values: Vec<(i32, i32)>,
-        next_leaf: Option<u32>,
+        next_leaf: Option<i32>,
         max_degree: usize
     ) -> Self {
         Self {
@@ -413,7 +413,7 @@ impl NodePage {
         self.keys.len() < self.min_keys()
     }
 
-    pub fn find_left_most_node(&self, pager: &NodePager) -> Result<Option<u32>, NodeOperationError> {
+    pub fn find_left_most_node(&self, pager: &NodePager) -> Result<Option<i32>, NodeOperationError> {
         if self.is_leaf() {
             Ok(Some(*self.id()))
         } else {
@@ -422,7 +422,7 @@ impl NodePage {
         }
     }
 
-    pub fn find_node(&self, pager: &NodePager, key: i32) -> Result<Option<u32>, NodeOperationError> {
+    pub fn find_node(&self, pager: &NodePager, key: i32) -> Result<Option<i32>, NodeOperationError> {
         match self.find_key_index(key) {
             // is leaf
             FindKeyResponse::GreaterThanTheLast(_) if self.is_leaf() => Ok(None),
