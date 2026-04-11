@@ -5,17 +5,17 @@ use crate::{data::page::{Page, PageDataLayout, PageFileMetadata}, store::{Store,
 // Defines how many keys fit into one node
 const BTREE_MAX_DEGREE: u16 = 500;
 
-pub struct FileStore<'a> {
-    base_path: &'a Path,
+pub struct FileStore {
+    base_path: PathBuf,
 }
-impl<'a> FileStore<'a> {
-    pub fn new(base_path: &'a Path) -> Self {
+impl FileStore {
+    pub fn new(base_path: &Path) -> Self {
         if !base_path.is_dir() {
             // TODO: Use proper error handling
             panic!("FileStore needs a directory as a base_path");
         }
         Self { 
-            base_path,
+            base_path: base_path.to_path_buf(),
          }
     }
 
@@ -45,9 +45,9 @@ impl<'a> FileStore<'a> {
         Ok(())
     }
 }
-impl<'a> Store for FileStore<'a> {
+impl Store for FileStore {
     fn delete_all(&self) -> Result<(), StoreError> {
-        for entry in std::fs::read_dir(self.base_path)? {
+        for entry in std::fs::read_dir(&self.base_path)? {
             let entry = entry?;
             let path = entry.path();
 
