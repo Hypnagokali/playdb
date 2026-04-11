@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::{data::page::{PageDataLayout, PageError, Record}, store::{IndexedRowIterator, PageIterator, PageRowIterator, Store}, table::{Column, TableSchema, table::{Cell, Row, RowValidationError, Table}}, tree::store::BTreeStore};
 
 pub struct TableAccess<'db, S: ?Sized> {
-    table: &'db Table,
+    table: Table,
     // Having BTreeStore as a normal ref would fore TableAccess to be mutable everywhere
     indexed_columns: Vec<(i32, RefCell<BTreeStore>)>,
     store: &'db S,
@@ -222,7 +222,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
         self
     }
 
-    pub fn new(table: &'db Table, store: &'db S, layout: &'db PageDataLayout) -> Self {
+    pub fn new(table: Table, store: &'db S, layout: &'db PageDataLayout) -> Self {
         Self { 
             table,
             store,
@@ -241,12 +241,12 @@ impl<'db, S: Store> TableAccess<'db, S> {
     }
 
     /// Load all rows from all pages in the table
-    pub fn find_all(&self) -> Result<QueryResult<'db, (Record, Row)>, TableAccessError> {
-        let page_iter = PageIterator::new(self.table, self.store, self.layout);
+    pub fn find_all(&'db self) -> Result<QueryResult<'db, (Record, Row)>, TableAccessError> {
+        let page_iter = PageIterator::new(&self.table, self.store, self.layout);
         Ok(QueryResult::new(page_iter, self.table.schema().clone()))
     }
 
-    pub fn find(&self, col_name: &str, cell: Cell) -> Result<QueryResult<'db, (Record, Row)>, TableAccessError> {
+    pub fn find(&'db self, col_name: &str, cell: Cell) -> Result<QueryResult<'db, (Record, Row)>, TableAccessError> {
         let col_index = find_column_for_query_by_cell(self.table.schema(), col_name, &cell)?;
 
         // check index for column index:
@@ -261,7 +261,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
                 .map(|v| vec![v])
                 .unwrap_or_default();
 
-            let iter = IndexedRowIterator::new(self.table, self.store, self.layout, res);
+            let iter = IndexedRowIterator::new(&self.table, self.store, self.layout, res);
             let qr = QueryResult::from_indexes(iter, self.table.schema().clone());
 
             #[cfg(test)]
@@ -269,7 +269,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
         
             Ok(qr)
         } else {
-            let page_iter = PageIterator::new(self.table, self.store, self.layout);
+            let page_iter = PageIterator::new(&self.table, self.store, self.layout);
             let qr = QueryResult::new(page_iter, self.table.schema().clone());
 
             Ok(qr.filter(move |(_, row)| {
@@ -298,13 +298,13 @@ impl<'db, S: Store> TableAccess<'db, S> {
 
         for (page_id, records_to_delete) in page_row_map {
             for (record, uic) in records_to_delete {
-                let mut page = self.store.read_page(self.layout, page_id, self.table)
+                let mut page = self.store.read_page(self.layout, page_id, &self.table)
                     .map_err(|e| TableAccessError::DeleteRowsError(e.to_string()))?;
 
                 page.delete_record(*record.record_index());
                 self.update_index(page_id, *record.record_index(), uic)?;
 
-                self.store.write_page(self.layout, &page, self.table)
+                self.store.write_page(self.layout, &page, &self.table)
                     .map_err(|e| TableAccessError::DeleteRowsError(e.to_string()))?;
             }
         }
@@ -391,7 +391,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
         // iterate over updated_rows_map and write back updated rows to pages
         // in place or delete and reinsert
         for (page_id, updated_rows) in updated_rows_map.into_iter() {
-            let mut page = self.store.read_page(self.layout, page_id, self.table)
+            let mut page = self.store.read_page(self.layout, page_id, &self.table)
                 .map_err(|e| TableAccessError::UpdateRowsError(e.to_string()))?;
 
             if not_in_place_update {
@@ -408,7 +408,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
                         rows_needs_another_page.push((row_data, update_index_cmd));
                     }
 
-                    self.store.write_page(self.layout, &page, self.table)
+                    self.store.write_page(self.layout, &page, &self.table)
                         .map_err(|_| TableAccessError::UpdateRowsError("Reinsert update error: cannot write page".to_string()))?
                 }
             } else {
@@ -418,7 +418,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
                     page.write_record(*record.record_index(), row_data)?;
                     self.update_index(page.page_id(), *record.record_index(), update_index_cmd)?;
 
-                    self.store.write_page(self.layout, &page, self.table)
+                    self.store.write_page(self.layout, &page, &self.table)
                         .map_err(|_| TableAccessError::UpdateRowsError("Write in place error: cannot write page".to_string()))?;
                 }
             }
@@ -440,7 +440,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
     // Should be refactored, so that FSM is used to find pages with free space
     /// Returns (page_id, slot_id)
     fn raw_insert<B: FnOnce(&Self, (i32, usize)) -> Result<(), TableAccessError>>(&self, row_data: Vec<u8>, before_saving_hook: B) -> Result<(i32, usize), TableAccessError> {
-        let page_iterator = self.store.seq_page_iterator(self.layout, self.table)
+        let page_iterator = self.store.seq_page_iterator(self.layout, &self.table)
             .map_err(|_| TableAccessError::InsertRowError("Cannot retrieve page iterator".to_string()))?;
 
         for mut page in page_iterator {
@@ -449,7 +449,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
 
                 before_saving_hook(self, (page.page_id(), slot_id))?;
 
-                self.store.write_page(self.layout, &page, self.table)
+                self.store.write_page(self.layout, &page, &self.table)
                     .map_err(|e| TableAccessError::InsertRowError(format!("Cannot write page: {}", e.to_string())))?;
 
                 return Ok((page.page_id(), slot_id));
@@ -459,7 +459,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
         // No page with enough space found, so allocate a new one:
         // this can lead to a lot of new allocated pages, for example, if the the before_saving_hook fails.
         // Actually, the new_page must be deallocated, if the hook fails.
-        let mut new_page = self.store.allocate_page(self.layout, self.table)
+        let mut new_page = self.store.allocate_page(self.layout, &self.table)
             .map_err(|e| TableAccessError::InsertRowError(format!("Cannot allocate page: {}", e.to_string())))?;
 
         // If row size is larger than page data size, it will fail here
@@ -467,7 +467,7 @@ impl<'db, S: Store> TableAccess<'db, S> {
 
         before_saving_hook(self, (new_page.page_id(), slot_id))?;
 
-        self.store.write_page(self.layout, &new_page, self.table)
+        self.store.write_page(self.layout, &new_page, &self.table)
             .map_err(|e| TableAccessError::InsertRowError(format!("Cannot write new allocated page: {}", e.to_string())))?;
 
         Ok((new_page.page_id(), slot_id))
@@ -517,7 +517,7 @@ mod tests {
         let layout = PageDataLayout::new(64).unwrap();
         store.create(&layout, &table).unwrap();
 
-        let access = TableAccess::new(&table, &store, &layout);
+        let access = TableAccess::new(table, &store, &layout);
 
         let first = Row::new(vec![
             Cell::Varchar("Rabbit".to_owned()),
@@ -566,7 +566,7 @@ mod tests {
         let layout = PageDataLayout::new(64).unwrap();
         store.create(&layout, &table).unwrap();
 
-        let access = TableAccess::new(&table, &store, &layout);
+        let access = TableAccess::new(table, &store, &layout);
 
         let first = Row::new(vec![
             Cell::Varchar("Rabbit".to_owned()),
@@ -620,7 +620,7 @@ mod tests {
         let layout = PageDataLayout::new(64).unwrap();
         store.create(&layout, &table).unwrap();
 
-        let access = TableAccess::new(&table, &store, &layout);
+        let access = TableAccess::new(table, &store, &layout);
 
         let first_row = Row::new(vec![
             Cell::Varchar("Rabbit".to_owned()),
@@ -664,7 +664,7 @@ mod tests {
 
         let btree = RefCell::new(store.read_btree(1).unwrap());
 
-        let access = TableAccess::new(&table, &store, &layout)
+        let access = TableAccess::new(table, &store, &layout)
             .with_indexes(vec![(1, btree)]);
 
         let first_row = Row::new(vec![
@@ -703,7 +703,7 @@ mod tests {
 
         let btree = RefCell::new(store.read_btree(1).unwrap());
 
-        let access = TableAccess::new(&table, &store, &layout)
+        let access = TableAccess::new(table.clone(), &store, &layout)
             .with_indexes(vec![(1, btree)]);
 
         let first_row = Row::new(vec![
@@ -742,7 +742,7 @@ mod tests {
 
         let btree = RefCell::new(store.read_btree(1).unwrap());
 
-        let access = TableAccess::new(&table, &store, &layout)
+        let access = TableAccess::new(table, &store, &layout)
             .with_indexes(vec![(1, btree)]);
 
         let first_row = Row::new(vec![
@@ -783,7 +783,7 @@ mod tests {
 
         let btree = RefCell::new(store.read_btree(1).unwrap());
 
-        let access = TableAccess::new(&table, &store, &layout)
+        let access = TableAccess::new(table, &store, &layout)
             .with_indexes(vec![(1, btree)]);
 
         let first_row = Row::new(vec![
@@ -816,7 +816,7 @@ mod tests {
 
         let btree = RefCell::new(store.read_btree(1).unwrap());
 
-        let access = TableAccess::new(&table, &store, &layout)
+        let access = TableAccess::new(table.clone(), &store, &layout)
             .with_indexes(vec![(1, btree)]);
 
         let first_row = Row::new(vec![
@@ -866,7 +866,7 @@ mod tests {
         let layout = PageDataLayout::new(32).unwrap();
         store.create(&layout, &table).unwrap();
 
-        let access = TableAccess::new(&table, &store, &layout);
+        let access = TableAccess::new(table, &store, &layout);
 
         let first_row = Row::new(vec![
             Cell::Int(42),
@@ -908,7 +908,7 @@ mod tests {
         let layout = PageDataLayout::new(64).unwrap();
         store.create(&layout, &table).unwrap();
 
-        let access = TableAccess::new(&table, &store, &layout);
+        let access = TableAccess::new(table, &store, &layout);
 
         let first_row = Row::new(vec![
             Cell::Varchar("Hans".to_owned())
@@ -941,7 +941,7 @@ mod tests {
 
         store.create(&layout, &table).unwrap();
 
-        let access = TableAccess::new(&table, &store, &layout);
+        let access = TableAccess::new(table, &store, &layout);
 
         let first_row = Row::new(vec![
             Cell::Int(1),
@@ -977,7 +977,7 @@ mod tests {
         
         store.create(&layout, &table).unwrap();
 
-        let access = TableAccess::new(&table, &store, &layout);
+        let access = TableAccess::new(table, &store, &layout);
 
         let first_row = Row::new(vec![
             Cell::Int(1),
@@ -1015,7 +1015,7 @@ mod tests {
         let layout = PageDataLayout::new(64).unwrap();
 
         store.create(&layout, &table).unwrap();
-        let access = TableAccess::new(&table, &store, &layout);
+        let access = TableAccess::new(table, &store, &layout);
 
         let first_row = Row::new(vec![
             Cell::Int(1),
@@ -1049,7 +1049,7 @@ mod tests {
         let layout: PageDataLayout = PageDataLayout::new(1024).unwrap();
 
         store.create(&layout, &person_table).unwrap();
-        let person_access = TableAccess::new(&person_table, &store, &layout);
+        let person_access = TableAccess::new(person_table, &store, &layout);
 
         let first_person = Row::new(vec![
             Cell::Int(1),
@@ -1072,7 +1072,7 @@ mod tests {
         let address_table = Table::new(2, "addresses".to_owned(), address_schema);
         store.create(&layout, &address_table).unwrap();
 
-        let address_access = TableAccess::new(&address_table, &store, &layout);
+        let address_access = TableAccess::new(address_table, &store, &layout);
 
         let first_address = Row::new(vec![
             Cell::Int(1),

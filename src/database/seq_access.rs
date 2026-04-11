@@ -6,7 +6,7 @@ use crate::{database::table_access::{TableAccess, TableAccessError}, store::Stor
 
 pub struct SeqAccess<'db, S: Store> {
     sequence_acc: TableAccess<'db, S>,
-    table: &'db Table,
+    table: Table,
 }
 
 #[derive(Error, Debug)]
@@ -32,7 +32,7 @@ impl From<TableAccessError> for SeqAccessError {
 }
 
 impl<'db, S: Store> SeqAccess<'db, S> {
-    pub fn new(sequence_acc: TableAccess<'db, S>, table: &'db Table) -> Self {
+    pub fn new(sequence_acc: TableAccess<'db, S>, table: Table) -> Self {
         Self {
             sequence_acc,
             table,
@@ -96,7 +96,7 @@ mod tests {
         let layout = PageDataLayout::new(1028).unwrap();
 
         store.create(&layout, &seq_table).unwrap();
-        let access = TableAccess::new(&seq_table, &store, &layout);
+        let access = TableAccess::new(seq_table, &store, &layout);
 
         let my_seq = Row::new(vec![
             Cell::Int(1),
@@ -115,7 +115,7 @@ mod tests {
 
         let dummy_table = Table::new(2, "dummy".to_owned(), dummy_schema);
 
-        let mut seq_access = SeqAccess::new(access, &dummy_table);
+        let mut seq_access = SeqAccess::new(access, dummy_table);
         assert_eq!(seq_access.next_val("id").unwrap(), 1);
         assert_eq!(seq_access.next_val("id").unwrap(), 2);
         assert_eq!(seq_access.next_val("id").unwrap(), 3);
