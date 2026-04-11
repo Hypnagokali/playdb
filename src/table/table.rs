@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use thiserror::Error;
 
 use crate::table::{self, ColumnType, TableSchema};
@@ -15,11 +17,15 @@ pub struct Row {
 }
 
 #[derive(Debug)]
-pub struct Table {
+struct TableInner {
     id: i32,
     name: String,
     schema: TableSchema,
-    num_pages: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Table {
+    inner: Rc<TableInner>,
 }
 
 #[derive(PartialEq, Debug, Error)]
@@ -102,35 +108,34 @@ impl Row {
 impl Table {
     pub fn new(id: i32, name: String, schema: TableSchema) -> Self {
         Self {
-            id,
-            name,
-            schema,
-            num_pages: 0,
+            inner: Rc::new(
+                TableInner {
+                    id,
+                    name,
+                    schema,
+                }
+            )
         }
     }
 
     pub fn id(&self) -> i32 {
-        self.id
+        self.inner.id
     }
 
     pub fn name(&self) -> &str {
-        &self.name
+        &self.inner.name
     }
 
     pub fn schema(&self) -> &TableSchema {
-        &self.schema
-    }
-
-    pub fn num_pages(&self) -> usize {
-        self.num_pages
+        &self.inner.schema
     }
 
     pub fn file_path(&self) -> String {
-        format!("table_{}.dat", self.id)
+        format!("table_{}.dat", self.id())
     }
 
     pub fn validate_row(&self, row: &Row) -> Result<(), RowValidationError> {
-        row.validate(&self.schema)
+        row.validate(&self.inner.schema)
     }
 }
 
@@ -283,12 +288,11 @@ mod tests {
             Column::new(1, "id", ColumnType::Int),
         ]);
 
-        let table = Table {
-            id: 42,
-            name: "users".to_string(),
+        let table = Table::new(
+            42,
+            "users".to_string(),
             schema,
-            num_pages: 5,
-        };
+        );
 
         assert_eq!(table.file_path(), "table_42.dat");
     }
@@ -301,12 +305,11 @@ mod tests {
             Column::new(3, "active", ColumnType::Byte),
         ]);
 
-        let table = Table {
-            id: 1,
-            name: "users".to_string(),
+        let table = Table::new(
+            1,
+            "users".to_string(),
             schema,
-            num_pages: 0,
-        };
+        );
 
         let valid_row = Row {
             cells: vec![
@@ -326,12 +329,11 @@ mod tests {
             Column::new(2, "name", ColumnType::Varchar(50)),
         ]);
 
-        let table = Table {
-            id: 1,
-            name: "users".to_string(),
+        let table = Table::new(
+            1,
+            "users".to_string(),
             schema,
-            num_pages: 0,
-        };
+        );
 
         let invalid_row = Row {
             cells: vec![
@@ -353,12 +355,11 @@ mod tests {
             Column::new(2, "name", ColumnType::Varchar(50)),
         ]);
 
-        let table = Table {
-            id: 1,
-            name: "users".to_string(),
+        let table = Table::new(
+            1,
+            "users".to_string(),
             schema,
-            num_pages: 0,
-        };
+        );
 
         let invalid_row = Row {
             cells: vec![
@@ -379,12 +380,7 @@ mod tests {
             Column::new(1, "name", ColumnType::Varchar(10)),
         ]);
 
-        let table = Table {
-            id: 1,
-            name: "users".to_string(),
-            schema,
-            num_pages: 0,
-        };
+        let table = Table::new(1, "users".to_string(), schema);
 
         // Row with varchar longer than max length
         let invalid_row = Row {
