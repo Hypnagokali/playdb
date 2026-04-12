@@ -16,14 +16,17 @@ fn binary_search(key: &i32, keys: &[i32]) -> FindKeyResponse {
     let mut high = last_element;
     let mut low = 0;
 
-    if keys.len() == 0 {
+    if keys.len() == 0 || key > &keys[last_element] {
         return FindKeyResponse::GreaterThanTheLast(last_element);
     }
     
     let mut mid;
     while (high - low > 8) {
         mid = (low + high) / 2;
-        if key < &keys[mid] {
+
+        if key == &keys[mid] {
+            return FindKeyResponse::Equal(mid);
+        } else if key < &keys[mid] {
             high = mid;
         } else {
             low = mid + 1;
@@ -39,6 +42,7 @@ fn binary_search(key: &i32, keys: &[i32]) -> FindKeyResponse {
         }
     }
 
+    // Should never reach this point
     return FindKeyResponse::GreaterThanTheLast(last_element);
 }
 

@@ -45,17 +45,6 @@ fn find_by_id_index(db: &Database<FileStore>, id: i32) {
     }
 }
 
-fn find_sequentially(db: &Database<FileStore>, id: i32) {
-    let table = db.read_table("persons").unwrap();
-    let tbl_acc = db.table_access(table).unwrap();
-
-    for (_, r) in  tbl_acc.find_all().unwrap().rows() {
-        if r.cells()[0] == Cell::Int(id) {
-            println!("{:?}", r);
-        }
-    }
-}
-
 fn find_by_number_without_index(db: &Database<FileStore>, num: i32) {
     let table = db.read_table("persons").unwrap();
     let tbl_acc = db.table_access(table).unwrap();
@@ -69,7 +58,6 @@ fn find_by_number_without_index(db: &Database<FileStore>, num: i32) {
 fn main() {
     let db = Database::new("testdb");
     // create_table_persons(&db);
-    // find_by_id_index(&db);
+    // find_by_id_index(&db, 19999);
     // find_by_number_without_index(&db, 20000);
-    // find_sequentially(&db, 19900);
 }
